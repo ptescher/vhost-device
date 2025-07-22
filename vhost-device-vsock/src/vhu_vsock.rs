@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use log::warn;
+use log::{info, warn};
 use thiserror::Error as ThisError;
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackend, VringRwLock};
@@ -155,10 +155,20 @@ pub(crate) struct VsockProxyInfo {
     pub listen_ports: Vec<u32>,
 }
 
+#[cfg(feature = "backend_vsock")]
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) struct UnixToVsockInfo {
+    pub target_cid: u32,
+    pub target_port: u32,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) enum BackendType {
-    /// unix domain socket path
+    /// unix domain socket path - traditional mode with CONNECT commands
     UnixDomainSocket(PathBuf),
+    /// unix domain socket path forwarded to specific vsock CID:port
+    #[cfg(feature = "backend_vsock")]
+    UnixToVsock(PathBuf, UnixToVsockInfo),
     /// the vsock CID and ports
     #[cfg(feature = "backend_vsock")]
     Vsock(VsockProxyInfo),
@@ -240,6 +250,15 @@ impl ConnMapKey {
             peer_port,
         }
     }
+
+    pub fn local_port(&self) -> u32 {
+        self.local_port
+    }
+
+    #[allow(dead_code)]
+    pub fn peer_port(&self) -> u32 {
+        self.peer_port
+    }
 }
 
 /// Virtio Vsock Configuration
@@ -314,9 +333,22 @@ impl VhostUserBackend for VhostUserVsockBackend {
     }
 
     fn update_memory(&self, atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>) -> IoResult<()> {
-        for thread in self.threads.iter() {
-            thread.lock().unwrap().mem = Some(atomic_mem.clone());
+        info!("vsock: update_memory called for device with {} threads", self.threads.len());
+        for (idx, thread) in self.threads.iter().enumerate() {
+            let mut thread_guard = thread.lock().unwrap();
+            let guest_cid = thread_guard.thread_backend.guest_cid;
+            info!("vsock: [CID {}] setting memory for thread {}", guest_cid, idx);
+            
+            let was_none = thread_guard.mem.is_none();
+            thread_guard.mem = Some(atomic_mem.clone());
+            
+            if was_none {
+                info!("vsock: [CID {}] thread {} memory configured for first time - backend events now enabled", guest_cid, idx);
+            } else {
+                info!("vsock: [CID {}] thread {} memory updated", guest_cid, idx);
+            }
         }
+        info!("vsock: memory configuration complete");
         Ok(())
     }
 
@@ -327,25 +359,57 @@ impl VhostUserBackend for VhostUserVsockBackend {
         vrings: &[VringRwLock],
         thread_id: usize,
     ) -> IoResult<()> {
+        info!(
+            "vsock: handle_event called with device_event={}, evset={:?}, thread_id={}",
+            device_event, evset, thread_id
+        );
+
         let vring_rx = &vrings[0];
         let vring_tx = &vrings[1];
 
         if evset != EventSet::IN {
+            warn!(
+                "vsock: handle_event received unexpected evset {:?}, expected EventSet::IN",
+                evset
+            );
             return Err(Error::HandleEventNotEpollIn.into());
         }
 
         let mut thread = self.threads[thread_id].lock().unwrap();
         let evt_idx = thread.event_idx;
 
+        info!(
+            "vsock: [CID {}] processing device_event={} with evt_idx={}",
+            thread.thread_backend.guest_cid, device_event, evt_idx
+        );
+
         match device_event {
-            RX_QUEUE_EVENT => {}
+            RX_QUEUE_EVENT => {
+                info!(
+                    "vsock: [CID {}] received RX_QUEUE_EVENT",
+                    thread.thread_backend.guest_cid
+                );
+                // RX processing happens at the end, so just log here
+            }
             TX_QUEUE_EVENT => {
+                info!(
+                    "vsock: [CID {}] received TX_QUEUE_EVENT",
+                    thread.thread_backend.guest_cid
+                );
                 thread.process_tx(vring_tx, evt_idx)?;
             }
             EVT_QUEUE_EVENT => {
+                info!(
+                    "vsock: [CID {}] received EVT_QUEUE_EVENT",
+                    thread.thread_backend.guest_cid
+                );
                 warn!("Received an unexpected EVT_QUEUE_EVENT");
             }
             BACKEND_EVENT => {
+                info!(
+                    "vsock: [CID {}] received BACKEND_EVENT",
+                    thread.thread_backend.guest_cid
+                );
                 thread.process_backend_evt(evset);
                 if let Err(e) = thread.process_tx(vring_tx, evt_idx) {
                     match e {
@@ -357,17 +421,54 @@ impl VhostUserBackend for VhostUserVsockBackend {
                 }
             }
             SIBLING_VM_EVENT => {
+                let guest_cid = thread.thread_backend.guest_cid;
+                info!(
+                    "vsock: [CID {}] received SIBLING_VM_EVENT notification",
+                    guest_cid
+                );
                 let _ = thread.sibling_event_fd.read();
-                thread.process_raw_pkts(vring_rx, evt_idx)?;
+
+                // Check if memory is configured before processing
+                if thread.mem.is_none() {
+                    info!(
+                        "vsock: [CID {}] No guest VM memory - checking for Unix socket proxy mode",
+                        guest_cid
+                    );
+
+                    // Process packets directly without guest VM
+                    match thread.process_raw_pkts_as_proxy() {
+                        Ok(()) => info!(
+                            "vsock: [CID {}] finished processing raw packets in proxy mode",
+                            guest_cid
+                        ),
+                        Err(e) => warn!(
+                            "vsock: [CID {}] error processing raw packets in proxy mode: {:?}",
+                            guest_cid, e
+                        ),
+                    }
+                } else {
+                    info!(
+                        "vsock: [CID {}] processing raw packets from sibling VMs",
+                        guest_cid
+                    );
+                    thread.process_raw_pkts(vring_rx, evt_idx)?;
+                }
                 return Ok(());
             }
             _ => {
+                warn!(
+                    "vsock: [CID {}] received unknown event: {}",
+                    thread.thread_backend.guest_cid, device_event
+                );
                 return Err(Error::HandleUnknownEvent.into());
             }
         }
 
         if device_event != EVT_QUEUE_EVENT {
-            thread.process_rx(vring_rx, evt_idx)?;
+            // Only process RX queue if we have guest memory (not in proxy mode)
+            if thread.mem.is_some() {
+                thread.process_rx(vring_rx, evt_idx)?;
+            }
         }
 
         Ok(())
