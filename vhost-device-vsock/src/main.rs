@@ -30,8 +30,10 @@ use vhost_user_backend::VhostUserDaemon;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 
 #[cfg(feature = "backend_vsock")]
-use crate::vhu_vsock::VsockProxyInfo;
-use crate::vhu_vsock::{BackendType, CidMap, VhostUserVsockBackend, VsockConfig};
+use crate::vhu_vsock::{BackendType, VhostUserVsockBackend};
+#[cfg(feature = "backend_vsock")]
+use crate::vhu_vsock::{UnixToVsockInfo, VsockProxyInfo};
+use crate::vhu_vsock::{CidMap, VsockConfig};
 
 const DEFAULT_GUEST_CID: u64 = 3;
 const DEFAULT_TX_BUFFER_SIZE: u32 = 64 * 1024;
@@ -98,16 +100,57 @@ struct VsockParam {
         long,
         conflicts_with = "forward_cid",
         conflicts_with = "forward_listen",
+        conflicts_with = "uds_forward_cid",
+        conflicts_with = "uds_forward_port",
         conflicts_with = "config",
         conflicts_with = "vm"
     )]
     uds_path: Option<PathBuf>,
+
+    /// Unix socket path that forwards connections to a specific vsock CID
+    #[cfg(feature = "backend_vsock")]
+    #[arg(
+        long,
+        conflicts_with = "forward_cid",
+        conflicts_with = "forward_listen", 
+        conflicts_with = "uds_path",
+        conflicts_with = "config",
+        conflicts_with = "vm"
+    )]
+    uds_forward_path: Option<PathBuf>,
+    
+    /// The vsock CID to forward Unix socket connections to
+    #[cfg(feature = "backend_vsock")]
+    #[arg(
+        long,
+        conflicts_with = "forward_cid",
+        conflicts_with = "forward_listen",
+        conflicts_with = "uds_path", 
+        conflicts_with = "config",
+        conflicts_with = "vm",
+        requires = "uds_forward_path"
+    )]
+    uds_forward_cid: Option<u32>,
+
+    /// The vsock port to forward Unix socket connections to
+    #[cfg(feature = "backend_vsock")]
+    #[arg(
+        long,
+        conflicts_with = "forward_cid",
+        conflicts_with = "forward_listen",
+        conflicts_with = "uds_path",
+        conflicts_with = "config", 
+        conflicts_with = "vm",
+        requires = "uds_forward_path"
+    )]
+    uds_forward_port: Option<u32>,
 
     /// The vsock CID to forward connections from guest
     #[cfg(feature = "backend_vsock")]
     #[clap(
         long,
         conflicts_with = "uds_path",
+        conflicts_with = "uds_forward_path",
         conflicts_with = "config",
         conflicts_with = "vm"
     )]
@@ -219,6 +262,13 @@ fn parse_vm_params(s: &str) -> Result<VsockConfig, VmArgsParseError> {
     #[cfg(feature = "backend_vsock")]
     let mut forward_listen: Option<Vec<u32>> = None;
 
+    #[cfg(feature = "backend_vsock")]
+    let mut uds_forward_path = None;
+    #[cfg(feature = "backend_vsock")]
+    let mut uds_forward_cid = None;
+    #[cfg(feature = "backend_vsock")]
+    let mut uds_forward_port: Option<u32> = None;
+
     for arg in s.trim().split(',') {
         let mut parts = arg.split('=');
         let key = parts.next().ok_or(VmArgsParseError::BadArgument)?;
@@ -230,6 +280,19 @@ fn parse_vm_params(s: &str) -> Result<VsockConfig, VmArgsParseError> {
             }
             "socket" => socket = Some(PathBuf::from(val)),
             "uds_path" | "uds-path" => uds_path = Some(PathBuf::from(val)),
+
+            #[cfg(feature = "backend_vsock")]
+            "uds_forward_path" | "uds-forward-path" => {
+                uds_forward_path = Some(PathBuf::from(val));
+            }
+            #[cfg(feature = "backend_vsock")]
+            "uds_forward_cid" | "uds-forward-cid" => {
+                uds_forward_cid = Some(val.parse().map_err(VmArgsParseError::ParseInteger)?)
+            }
+            #[cfg(feature = "backend_vsock")]
+            "uds_forward_port" | "uds-forward-port" => {
+                uds_forward_port = Some(val.parse().map_err(VmArgsParseError::ParseInteger)?)
+            }
 
             #[cfg(feature = "backend_vsock")]
             "forward_cid" | "forward-cid" => {
@@ -252,23 +315,24 @@ fn parse_vm_params(s: &str) -> Result<VsockConfig, VmArgsParseError> {
     }
 
     #[cfg(feature = "backend_vsock")]
-    let backend_info = match (uds_path, forward_cid) {
-        (Some(path), None) => BackendType::UnixDomainSocket(path),
-        (None, Some(cid)) => {
+    let backend_info = match (uds_path, uds_forward_path, uds_forward_cid, uds_forward_port, forward_cid) {
+        (Some(path), None, None, None, None) => BackendType::UnixDomainSocket(path),
+        (None, Some(path), Some(cid), Some(port), None) => {
+            BackendType::UnixToVsock(path, UnixToVsockInfo {
+                target_cid: cid,
+                target_port: port,
+            })
+        }
+        (None, None, None, None, Some(cid)) => {
             let listen_ports: Vec<u32> = forward_listen.unwrap_or_default();
             BackendType::Vsock(VsockProxyInfo {
                 forward_cid: cid,
                 listen_ports,
             })
         }
-        (None, None) => {
-            return Err(VmArgsParseError::RequiredKeyNotFound(
-                "uds-path or forward-cid".to_string(),
-            ))
-        }
         _ => {
             return Err(VmArgsParseError::RequiredKeyNotFound(
-                "Only one of uds-path or forward-cid can be provided".to_string(),
+                "Must specify one of: uds-path, uds-forward-path+uds-forward-cid+uds-forward-port, or forward-cid".to_string(),
             ))
         }
     };
@@ -523,6 +587,13 @@ mod tests {
                     #[cfg(feature = "backend_vsock")]
                     forward_listen: None,
 
+                    #[cfg(feature = "backend_vsock")]
+                    uds_forward_path: None,
+                    #[cfg(feature = "backend_vsock")]
+                    uds_forward_cid: None,
+                    #[cfg(feature = "backend_vsock")]
+                    uds_forward_port: None,
+
                     tx_buffer_size,
                     queue_size,
                     groups: groups.to_string(),
@@ -547,6 +618,12 @@ mod tests {
                     guest_cid,
                     socket: socket.to_path_buf(),
                     uds_path: None,
+                    #[cfg(feature = "backend_vsock")]
+                    uds_forward_path: None,
+                    #[cfg(feature = "backend_vsock")]
+                    uds_forward_cid: None,
+                    #[cfg(feature = "backend_vsock")]
+                    uds_forward_port: None,
                     forward_cid: Some(forward_cid),
                     forward_listen: Some(forward_listen.to_string()),
                     tx_buffer_size,

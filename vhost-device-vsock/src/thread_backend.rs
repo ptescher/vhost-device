@@ -10,6 +10,7 @@ use std::{
     },
     result::Result as StdResult,
     sync::{Arc, RwLock},
+    net::Shutdown,
 };
 
 use log::{info, warn};
@@ -23,8 +24,9 @@ use vsock::VsockStream;
 use crate::{
     rxops::*,
     vhu_vsock::{
-        BackendType, CidMap, ConnMapKey, Error, Result, VSOCK_HOST_CID, VSOCK_OP_REQUEST,
-        VSOCK_OP_RST, VSOCK_TYPE_STREAM,
+        BackendType, CidMap, ConnMapKey, Error, Result, VSOCK_HOST_CID,
+        VSOCK_OP_CREDIT_UPDATE, VSOCK_OP_REQUEST, VSOCK_OP_RESPONSE, VSOCK_OP_RST, VSOCK_OP_RW,
+        VSOCK_TYPE_STREAM,
     },
     vhu_vsock_thread::VhostUserVsockThread,
     vsock_conn::*,
@@ -183,11 +185,20 @@ impl WriteVolatile for StreamType {
 
 pub(crate) trait IsHybridVsock {
     fn is_hybrid_vsock(&self) -> bool;
+    fn shutdown_write(&self) -> std::io::Result<()>;
 }
 
 impl IsHybridVsock for StreamType {
     fn is_hybrid_vsock(&self) -> bool {
         matches!(self, StreamType::Unix(_))
+    }
+
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        match self {
+            StreamType::Unix(stream) => stream.shutdown(Shutdown::Write),
+            #[cfg(feature = "backend_vsock")]
+            StreamType::Vsock(stream) => stream.shutdown(Shutdown::Write),
+        }
     }
 }
 
@@ -205,7 +216,7 @@ pub(crate) struct VsockThreadBackend {
     /// epoll for registering new host-side connections.
     epoll_fd: i32,
     /// CID of the guest.
-    guest_cid: u64,
+    pub guest_cid: u64,
     /// Set of allocated local ports.
     pub local_port_set: HashSet<u32>,
     tx_buffer_size: u32,
@@ -266,13 +277,26 @@ impl VsockThreadBackend {
     pub fn recv_pkt<B: BitmapSlice>(&mut self, pkt: &mut VsockPacket<B>) -> Result<()> {
         // Pop an event from the backend_rxq
         let key = self.backend_rxq.pop_front().ok_or(Error::EmptyBackendRxQ)?;
+        info!("vsock: recv_pkt processing key: {:?}", key);
+
         let conn = match self.conn_map.get_mut(&key) {
             Some(conn) => conn,
             None => {
                 // assume that the connection does not exist
+                warn!("vsock: recv_pkt - connection not found for key");
                 return Ok(());
             }
         };
+
+        if conn.rx_queue.is_empty() {
+            // It's possible to have a connection with no pending RX ops,
+            // for example when the guest has no data to send. This is not
+            // an error, but we have to consume the virtio descriptor, so we
+            // craft a harmless CREDIT_UPDATE packet that the guest can
+            // safely ignore.
+            pkt.set_op(VSOCK_OP_CREDIT_UPDATE);
+            return Ok(());
+        }
 
         if conn.rx_queue.peek() == Some(RxOps::Reset) {
             // Handle RST events here
@@ -301,11 +325,21 @@ impl VsockThreadBackend {
                 .set_buf_alloc(0)
                 .set_fwd_cnt(0);
 
+            info!(
+                "vsock: recv_pkt sending RST - src_cid:{}, src_port:{}, dst_cid:{}, dst_port:{}",
+                VSOCK_HOST_CID, conn.local_port, conn.guest_cid, conn.peer_port
+            );
+
             return Ok(());
         }
 
         // Handle other packet types per connection
         conn.recv_pkt(pkt)?;
+
+        info!(
+            "vsock: recv_pkt delivered packet - src_cid:{}, src_port:{}, dst_cid:{}, dst_port:{}, op:{}, len:{}",
+            pkt.src_cid(), pkt.src_port(), pkt.dst_cid(), pkt.dst_port(), pkt.op(), pkt.len()
+        );
 
         Ok(())
     }
@@ -318,10 +352,56 @@ impl VsockThreadBackend {
     /// Returns:
     /// - always `Ok(())` if packet has been consumed correctly
     pub fn send_pkt<B: BitmapSlice>(&mut self, pkt: &VsockPacket<B>) -> Result<()> {
+        info!(
+            "vsock: [CID {}] send_pkt - src_cid:{}, src_port:{}, dst_cid:{}, dst_port:{}, op:{}, type:{}, len:{}",
+            self.guest_cid, pkt.src_cid(), pkt.src_port(), pkt.dst_cid(), pkt.dst_port(), pkt.op(), pkt.type_(), pkt.len()
+        );
+
+        // Log packet operation type for debugging
+        info!(
+            "vsock: [CID {}] GUEST TX PACKET: op={} - {}",
+            self.guest_cid, 
+            pkt.op(),
+            match pkt.op() {
+                1 => "VSOCK_OP_REQUEST",
+                2 => "VSOCK_OP_RESPONSE", 
+                3 => "VSOCK_OP_RST",
+                4 => "VSOCK_OP_SHUTDOWN",
+                5 => "VSOCK_OP_CREDIT_REQUEST",
+                6 => "VSOCK_OP_CREDIT_UPDATE",
+                7 => "VSOCK_OP_RW",
+                _ => "UNKNOWN_OP",
+            }
+        );
+
+        // Log any data payload from guest
+        if pkt.len() > 0 {
+            if let Some(data) = pkt.data_slice() {
+                // Create a regular slice from VolatileSlice for logging
+                let mut bytes = vec![0u8; data.len()];
+                data.copy_to(&mut bytes[..]);
+                
+                let hex_dump = bytes
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let ascii_dump = bytes
+                    .iter()
+                    .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                    .collect::<String>();
+                
+                info!(
+                    "vsock: [CID {}] GUEST TX DATA: {} bytes - HEX=[{}] ASCII=[{}]",
+                    self.guest_cid, bytes.len(), hex_dump, ascii_dump
+                );
+            }
+        }
+
         if pkt.src_cid() != self.guest_cid {
             warn!(
-                "vsock: dropping packet with inconsistent src_cid: {:?} from guest configured with CID: {:?}",
-                pkt.src_cid(), self.guest_cid
+                "vsock: [CID {}] dropping packet with inconsistent src_cid: {:?} from guest configured with CID: {:?}",
+                self.guest_cid, pkt.src_cid(), self.guest_cid
             );
             return Ok(());
         }
@@ -332,26 +412,35 @@ impl VsockThreadBackend {
             if dst_cid != VSOCK_HOST_CID {
                 let cid_map = self.cid_map.read().unwrap();
                 if cid_map.contains_key(&dst_cid) {
+                    info!("vsock: found CID {} in map, forwarding packet", dst_cid);
                     let (sibling_raw_pkts_queue, sibling_groups_set, sibling_event_fd) =
                         cid_map.get(&dst_cid).unwrap();
 
-                    if self
-                        .groups_set
-                        .read()
-                        .unwrap()
-                        .is_disjoint(sibling_groups_set.read().unwrap().deref())
-                    {
+                    let our_groups = self.groups_set.read().unwrap();
+                    let sibling_groups = sibling_groups_set.read().unwrap();
+                    info!(
+                        "vsock: our groups: {:?}, sibling groups: {:?}",
+                        *our_groups, *sibling_groups
+                    );
+
+                    if our_groups.is_disjoint(sibling_groups.deref()) {
                         info!("vsock: dropping packet for cid: {dst_cid:?} due to group mismatch");
                         return Ok(());
                     }
 
+                    info!("vsock: groups match, pushing packet to sibling queue");
                     sibling_raw_pkts_queue
                         .write()
                         .unwrap()
                         .push_back(RawVsockPacket::from_vsock_packet(pkt)?);
-                    let _ = sibling_event_fd.write(1);
+                    let written = sibling_event_fd.write(1);
+                    info!("vsock: wrote to sibling event_fd, result: {:?}", written);
                 } else {
                     warn!("vsock: dropping packet for unknown cid: {dst_cid:?}");
+                    info!(
+                        "vsock: available CIDs in map: {:?}",
+                        cid_map.keys().collect::<Vec<_>>()
+                    );
                 }
 
                 return Ok(());
@@ -365,14 +454,28 @@ impl VsockThreadBackend {
         }
 
         let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
+        
+        // Add specific logging for UnixToVsock connections
+        #[cfg(feature = "backend_vsock")]
+        if let BackendType::UnixToVsock(_, vsock_info) = &self.backend_info {
+            info!(
+                "vsock: [CID {}] UnixToVsock mode - processing guest TX packet for key {:?}, target_cid:{}, target_port:{}",
+                self.guest_cid, key, vsock_info.target_cid, vsock_info.target_port
+            );
+        }
 
         // TODO: Handle cases where connection does not exist and packet op
         // is not VSOCK_OP_REQUEST
         if !self.conn_map.contains_key(&key) {
             // The packet contains a new connection request
             if pkt.op() == VSOCK_OP_REQUEST {
+                info!("vsock: received connection request, handling new connection");
                 self.handle_new_guest_conn(pkt);
             } else {
+                warn!(
+                    "vsock: received packet op {} for non-existent connection, should send RST",
+                    pkt.op()
+                );
                 // TODO: send back RST
             }
             return Ok(());
@@ -400,6 +503,11 @@ impl VsockThreadBackend {
         }
 
         // Forward this packet to its listening connection
+        info!(
+            "vsock: [CID {}] forwarding packet op:{} to connection {:?}",
+            self.guest_cid, pkt.op(), key
+        );
+        
         let conn = self.conn_map.get_mut(&key).unwrap();
         conn.send_pkt(pkt)?;
 
@@ -418,6 +526,12 @@ impl VsockThreadBackend {
     /// - `Ok(())` if packet was successfully filled in
     /// - `Err(Error::EmptyRawPktsQueue)` if there was no available data
     pub fn recv_raw_pkt<B: BitmapSlice>(&mut self, pkt: &mut VsockPacket<B>) -> Result<()> {
+        let queue_size_before = self.raw_pkts_queue.read().unwrap().len();
+        info!(
+            "vsock: [CID {}] recv_raw_pkt called, queue size before pop: {}",
+            self.guest_cid, queue_size_before
+        );
+
         let raw_vsock_pkt = self
             .raw_pkts_queue
             .write()
@@ -425,11 +539,67 @@ impl VsockThreadBackend {
             .pop_front()
             .ok_or(Error::EmptyRawPktsQueue)?;
 
+        let queue_size_after = self.raw_pkts_queue.read().unwrap().len();
+        info!(
+            "vsock: [CID {}] popped packet from queue, queue size after: {}",
+            self.guest_cid, queue_size_after
+        );
+
         pkt.set_header_from_raw(&raw_vsock_pkt.header).unwrap();
         if !raw_vsock_pkt.data.is_empty() {
             let buf = pkt.data_slice().ok_or(Error::PktBufMissing)?;
             buf.copy_from(&raw_vsock_pkt.data);
         }
+
+        info!(
+            "vsock: recv_raw_pkt delivered packet from sibling - src_cid:{}, src_port:{}, dst_cid:{}, dst_port:{}, op:{}, type:{}, len:{}",
+            pkt.src_cid(), pkt.src_port(), pkt.dst_cid(), pkt.dst_port(), pkt.op(), pkt.type_(), pkt.len()
+        );
+
+        // Check if this is a connection request from a sibling VM
+        if pkt.op() == VSOCK_OP_REQUEST && pkt.type_() == VSOCK_TYPE_STREAM {
+            #[allow(irrefutable_let_patterns)]
+            if let BackendType::UnixDomainSocket(uds_path) = &self.backend_info {
+                let port_path = format!("{}_{}", uds_path.display(), pkt.dst_port());
+
+                // Check if there's a Unix socket listener - if so, we'll handle this as a proxy connection
+                if std::path::Path::new(&port_path).exists() {
+                    info!(
+                        "vsock: Sibling VM (CID {}) connecting to CID {} port {} - checking for Unix socket proxy at {}",
+                        pkt.src_cid(), self.guest_cid, pkt.dst_port(), port_path
+                    );
+
+                    // Since there's no guest VM for this CID, we'll need to handle the connection
+                    // directly by proxying to the Unix socket
+                    // For now, just log that this would be the place to implement it
+                    warn!(
+                        "vsock: Unix socket proxy for inter-VM connections not yet implemented. \
+                        Would proxy connection from CID {} to Unix socket {}",
+                        pkt.src_cid(),
+                        port_path
+                    );
+                } else {
+                    warn!(
+                        "vsock: ERROR - Sibling VM (CID {}) is trying to connect to port {} on CID {}, \
+                        but no listener found. Expected either a VM with vsock listener or Unix socket at: {}",
+                        pkt.src_cid(), pkt.dst_port(), self.guest_cid, port_path
+                    );
+                }
+            }
+        }
+
+        // Note: This packet will be delivered to the guest's vsock driver
+        // For incoming connections (op:1), the guest should have a listener on the dst_port
+        info!(
+            "vsock: raw packet delivered to guest driver for CID {} - guest should {} on port {}",
+            self.guest_cid,
+            if pkt.op() == VSOCK_OP_REQUEST {
+                "have a listener"
+            } else {
+                "process"
+            },
+            pkt.dst_port()
+        );
 
         Ok(())
     }
@@ -445,22 +615,77 @@ impl VsockThreadBackend {
     /// In case of proxying using vosck, attempts to connect to the
     /// {forward_cid, local_port}
     fn handle_new_guest_conn<B: BitmapSlice>(&mut self, pkt: &VsockPacket<B>) {
+        info!(
+            "vsock: handle_new_guest_conn - src_cid:{}, src_port:{}, dst_cid:{}, dst_port:{}",
+            pkt.src_cid(),
+            pkt.src_port(),
+            pkt.dst_cid(),
+            pkt.dst_port()
+        );
+
         match &self.backend_info {
             BackendType::UnixDomainSocket(uds_path) => {
                 let port_path = format!("{}_{}", uds_path.display(), pkt.dst_port());
-                UnixStream::connect(port_path)
+                info!("vsock: attempting to connect to Unix socket: {}", port_path);
+
+                UnixStream::connect(&port_path)
                     .and_then(|stream| stream.set_nonblocking(true).map(|_| stream))
                     .map_err(Error::UnixConnect)
-                    .and_then(|stream| self.add_new_guest_conn(StreamType::Unix(stream), pkt))
-                    .unwrap_or_else(|_| self.enq_rst());
+                    .and_then(|stream| {
+                        info!(
+                            "vsock: successfully connected to Unix socket: {}",
+                            port_path
+                        );
+                        self.add_new_guest_conn(StreamType::Unix(stream), pkt)
+                    })
+                    .unwrap_or_else(|err| {
+                        warn!(
+                            "vsock: failed to connect to Unix socket {}: {:?}",
+                            port_path, err
+                        );
+                        self.enq_rst()
+                    });
+            }
+            #[cfg(feature = "backend_vsock")]
+            BackendType::UnixToVsock(_, _vsock_info) => {
+                // For UnixToVsock mode, guest connections are not supported
+                // This mode is only for host->guest forwarding via Unix socket
+                warn!(
+                    "vsock: guest-initiated connection not supported in UnixToVsock mode, sending RST"
+                );
+                self.enq_rst();
             }
             #[cfg(feature = "backend_vsock")]
             BackendType::Vsock(vsock_info) => {
-                VsockStream::connect_with_cid_port(vsock_info.forward_cid, pkt.dst_port())
+                let forward_cid = vsock_info.forward_cid;
+                let dst_port = pkt.dst_port();
+                info!(
+                    "vsock: attempting to connect to vsock CID:{}, port:{}",
+                    forward_cid, dst_port
+                );
+
+                match VsockStream::connect_with_cid_port(forward_cid, dst_port)
                     .and_then(|stream| stream.set_nonblocking(true).map(|_| stream))
-                    .map_err(Error::VsockConnect)
-                    .and_then(|stream| self.add_new_guest_conn(StreamType::Vsock(stream), pkt))
-                    .unwrap_or_else(|_| self.enq_rst());
+                {
+                    Ok(stream) => {
+                        info!(
+                            "vsock: successfully connected to vsock CID:{}, port:{}",
+                            forward_cid, dst_port
+                        );
+                        self.add_new_guest_conn(StreamType::Vsock(stream), pkt)
+                            .unwrap_or_else(|err| {
+                                warn!("vsock: failed to add connection: {:?}", err);
+                                self.enq_rst()
+                            });
+                    }
+                    Err(err) => {
+                        warn!(
+                            "vsock: failed to connect to vsock CID:{}, port:{}: {:?}",
+                            forward_cid, dst_port, err
+                        );
+                        self.enq_rst();
+                    }
+                }
             }
         }
     }
@@ -471,6 +696,14 @@ impl VsockThreadBackend {
         stream: StreamType,
         pkt: &VsockPacket<B>,
     ) -> Result<()> {
+        info!(
+            "vsock: add_new_guest_conn - local_port:{}, peer_port:{}, src_cid:{}, dst_cid:{}",
+            pkt.dst_port(),
+            pkt.src_port(),
+            pkt.src_cid(),
+            pkt.dst_cid()
+        );
+
         let conn = VsockConnection::new_peer_init(
             stream.try_clone().map_err(match stream {
                 StreamType::Unix(_) => Error::UnixConnect,
@@ -486,6 +719,8 @@ impl VsockThreadBackend {
             self.tx_buffer_size,
         );
         let stream_fd = conn.stream.as_raw_fd();
+        info!("vsock: new connection established with fd: {}", stream_fd);
+
         self.listener_map
             .insert(stream_fd, ConnMapKey::new(pkt.dst_port(), pkt.src_port()));
 
@@ -502,6 +737,8 @@ impl VsockThreadBackend {
             stream_fd,
             epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
         )?;
+
+        info!("vsock: connection added successfully to all maps");
         Ok(())
     }
 
@@ -509,6 +746,184 @@ impl VsockThreadBackend {
     fn enq_rst(&mut self) {
         // TODO
         dbg!("New guest conn error: Enqueue RST");
+    }
+
+    /// Process raw packets in proxy mode - for virtual CIDs without guest VMs
+    pub fn recv_raw_pkt_proxy(&mut self) -> Result<()> {
+        let raw_vsock_pkt = self
+            .raw_pkts_queue
+            .write()
+            .unwrap()
+            .pop_front()
+            .ok_or(Error::EmptyRawPktsQueue)?;
+
+        // Parse the packet header
+        let header = &raw_vsock_pkt.header;
+        let src_cid = u64::from_le_bytes(header[0..8].try_into().unwrap());
+        let dst_cid = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let src_port = u32::from_le_bytes(header[16..20].try_into().unwrap());
+        let dst_port = u32::from_le_bytes(header[20..24].try_into().unwrap());
+        let _len = u32::from_le_bytes(header[24..28].try_into().unwrap());
+        let type_ = u16::from_le_bytes(header[28..30].try_into().unwrap());
+        let op = u16::from_le_bytes(header[30..32].try_into().unwrap());
+        let buf_alloc = u32::from_le_bytes(header[36..40].try_into().unwrap());
+
+        info!(
+            "vsock: [CID {}] proxy mode - received packet from CID {} port {} to port {}, op: {}",
+            self.guest_cid, src_cid, src_port, dst_port, op
+        );
+
+        // Only handle connection requests for now
+        if op == VSOCK_OP_REQUEST && type_ == VSOCK_TYPE_STREAM {
+            #[allow(irrefutable_let_patterns)]
+            if let BackendType::UnixDomainSocket(uds_path) = &self.backend_info {
+                let port_path = format!("{}_{}", uds_path.display(), dst_port);
+                info!(
+                    "vsock: [CID {}] attempting to connect to Unix socket: {}",
+                    self.guest_cid, port_path
+                );
+
+                match UnixStream::connect(&port_path) {
+                    Ok(stream) => {
+                        info!(
+                            "vsock: [CID {}] successfully connected to Unix socket for port {}",
+                            self.guest_cid, dst_port
+                        );
+
+                        // Set non-blocking mode
+                        if let Err(e) = stream.set_nonblocking(true) {
+                            warn!("vsock: failed to set non-blocking mode: {:?}", e);
+                            return Ok(());
+                        }
+
+                        // Create a connection entry
+                        let key = ConnMapKey::new(dst_port, src_port);
+
+                        if !self.conn_map.contains_key(&key) {
+                            let conn = VsockConnection::new_peer_init(
+                                StreamType::Unix(stream.try_clone().unwrap()),
+                                dst_cid,  // local CID
+                                dst_port, // local port
+                                src_cid,  // peer CID
+                                src_port, // peer port
+                                self.epoll_fd,
+                                buf_alloc,
+                                self.tx_buffer_size,
+                            );
+
+                            let stream_fd = conn.stream.as_raw_fd();
+                            self.listener_map.insert(stream_fd, key.clone());
+                            self.conn_map.insert(key.clone(), conn);
+                            self.backend_rxq.push_back(key);
+                            self.stream_map.insert(stream_fd, StreamType::Unix(stream));
+                            self.local_port_set.insert(dst_port);
+
+                            VhostUserVsockThread::epoll_register(
+                                self.epoll_fd,
+                                stream_fd,
+                                epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                            )
+                            .ok();
+
+                            info!("vsock: [CID {}] proxy connection established from CID {} to Unix socket", 
+                                self.guest_cid, src_cid);
+
+                            // We need to send the response back to the sibling VM
+                            // This requires accessing the sibling's queue
+                            if let Some((sibling_queue, _, sibling_event_fd)) =
+                                self.cid_map.read().unwrap().get(&src_cid)
+                            {
+                                // Create a response packet
+                                let mut response = RawVsockPacket {
+                                    header: [0; PKT_HEADER_SIZE],
+                                    data: vec![],
+                                };
+
+                                // Build VSOCK_OP_RESPONSE packet
+                                response.header[0..8].copy_from_slice(&dst_cid.to_le_bytes()); // src_cid
+                                response.header[8..16].copy_from_slice(&src_cid.to_le_bytes()); // dst_cid
+                                response.header[16..20].copy_from_slice(&dst_port.to_le_bytes()); // src_port
+                                response.header[20..24].copy_from_slice(&src_port.to_le_bytes()); // dst_port
+                                response.header[24..28].copy_from_slice(&0u32.to_le_bytes()); // len
+                                response.header[28..30]
+                                    .copy_from_slice(&VSOCK_TYPE_STREAM.to_le_bytes()); // type
+                                response.header[30..32]
+                                    .copy_from_slice(&VSOCK_OP_RESPONSE.to_le_bytes()); // op
+                                response.header[32..36].copy_from_slice(&0u32.to_le_bytes()); // flags
+                                response.header[36..40]
+                                    .copy_from_slice(&self.tx_buffer_size.to_le_bytes()); // buf_alloc
+                                response.header[40..44].copy_from_slice(&0u32.to_le_bytes()); // fwd_cnt
+
+                                sibling_queue.write().unwrap().push_back(response);
+                                let _ = sibling_event_fd.write(1);
+
+                                info!(
+                                    "vsock: [CID {}] sent VSOCK_OP_RESPONSE back to CID {}",
+                                    self.guest_cid, src_cid
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "vsock: [CID {}] failed to connect to Unix socket {}: {:?}",
+                            self.guest_cid, port_path, e
+                        );
+                        // TODO: Send RST packet back
+                    }
+                }
+            }
+        } else if op == VSOCK_OP_RW && type_ == VSOCK_TYPE_STREAM {
+            // Handle data packets
+            let key = ConnMapKey::new(dst_port, src_port);
+            if let Some(conn) = self.conn_map.get_mut(&key) {
+                info!("vsock: [CID {}] proxy mode - forwarding {} bytes of data from CID {} to Unix socket", 
+                    self.guest_cid, raw_vsock_pkt.data.len(), src_cid);
+
+                // Write the data to the Unix socket
+                if !raw_vsock_pkt.data.is_empty() {
+                    match conn.stream.write_all(&raw_vsock_pkt.data) {
+                        Ok(()) => {
+                            let hex_dump = raw_vsock_pkt.data
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let ascii_dump = raw_vsock_pkt.data
+                                .iter()
+                                .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                                .collect::<String>();
+                            
+                            info!(
+                                "vsock: [CID {}] successfully wrote {} bytes to Unix socket: HEX=[{}] ASCII=[{}]",
+                                self.guest_cid,
+                                raw_vsock_pkt.data.len(),
+                                hex_dump,
+                                ascii_dump
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "vsock: [CID {}] failed to write to Unix socket: {:?}",
+                                self.guest_cid, e
+                            );
+                        }
+                    }
+                }
+
+                // TODO: Handle flow control - send credit update if needed
+            } else {
+                warn!("vsock: [CID {}] proxy mode - no connection found for data packet from CID {} port {} to port {}", 
+                    self.guest_cid, src_cid, src_port, dst_port);
+            }
+        } else {
+            info!(
+                "vsock: [CID {}] proxy mode - packet with op: {} not yet handled",
+                self.guest_cid, op
+            );
+        }
+
+        Ok(())
     }
 }
 

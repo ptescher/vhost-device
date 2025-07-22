@@ -6,7 +6,7 @@ use std::{
     os::unix::prelude::{AsRawFd, RawFd},
 };
 
-use log::{error, info};
+use log::{error, info, warn};
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
 use vm_memory::{bitmap::BitmapSlice, ReadVolatile, VolatileSlice, WriteVolatile};
 
@@ -149,6 +149,8 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
 
                 // Check if peer has space for receiving data
                 if self.need_credit_update_from_peer() {
+                    // Re-enqueue the read so we can process it once we have credit.
+                    self.rx_queue.enqueue(RxOps::Rw);
                     self.last_fwd_cnt = self.fwd_cnt;
                     pkt.set_op(VSOCK_OP_CREDIT_REQUEST);
                     return Ok(());
@@ -163,41 +165,84 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
                     .subslice(0, max_read_len)
                     .expect("subslicing should work since length was checked");
                 // Read data from the stream directly into the buffer
-                if let Ok(read_cnt) = self.stream.read_volatile(&mut buf) {
-                    if read_cnt == 0 {
-                        // If no data was read then the stream was closed down unexpectedly.
-                        // Send a shutdown packet to the guest-side application.
-                        pkt.set_op(VSOCK_OP_SHUTDOWN)
-                            .set_flag(VSOCK_FLAGS_SHUTDOWN_RCV)
-                            .set_flag(VSOCK_FLAGS_SHUTDOWN_SEND);
-                    } else {
-                        // If data was read, then set the length field in the packet header
-                        // to the amount of data that was read.
-                        pkt.set_op(VSOCK_OP_RW).set_len(read_cnt as u32);
+                match self.stream.read_volatile(&mut buf) {
+                    Ok(read_cnt) => {
+                        if read_cnt == 0 {
+                            // If no data was read then the stream was closed down unexpectedly.
+                            // Send a shutdown packet to the guest-side application.
+                            pkt.set_op(VSOCK_OP_SHUTDOWN)
+                                .set_flag(VSOCK_FLAGS_SHUTDOWN_RCV)
+                                .set_flag(VSOCK_FLAGS_SHUTDOWN_SEND);
+                        } else {
+                            // If data was read, then set the length field in the packet header
+                            // to the amount of data that was read.
+                            pkt.set_op(VSOCK_OP_RW).set_len(read_cnt as u32);
 
-                        // Re-register the stream file descriptor for read and write events
+                            if read_cnt == max_read_len {
+                                // Re-queue the read operation in case there's more data to process
+                                // from the Unix socket in the next available descriptor.
+                                self.rx_queue.enqueue(RxOps::Rw);
+                            } else {
+                                // The socket read returned less data than we asked for.
+                                // It's likely empty, so let's wait for epoll to tell us
+                                // when there is more data, instead of busy-waiting.
+                                let mut events = epoll::Events::EPOLLIN;
+                                if !self.tx_buf.is_empty() {
+                                    events |= epoll::Events::EPOLLOUT;
+                                }
+                                if VhostUserVsockThread::epoll_modify(
+                                    self.epoll_fd,
+                                    self.stream.as_raw_fd(),
+                                    events,
+                                )
+                                .is_err()
+                                {
+                                    error!("Failed to re-enable EPOLLIN after partial read");
+                                }
+                            }
+                        }
+
+                        // Update the rx_cnt with the amount of data in the vsock packet.
+                        self.rx_cnt += Wrapping(pkt.len());
+                        self.last_fwd_cnt = self.fwd_cnt;
+                    }
+                    Err(vm_memory::VolatileMemoryError::IOError(e))
+                        if e.kind() == ErrorKind::WouldBlock =>
+                    {
+                        // This is not an error. It just means we've read all the data
+                        // available in the socket right now.
+
+                        // We got a `WouldBlock` after dequeuing an `RxOps::Rw`,
+                        // so we need to put it back to be processed later.
+                        self.rx_queue.enqueue(RxOps::Rw);
+
+                        // Re-enable EPOLLIN to wait for more data. We also need to
+                        // preserve EPOLLOUT if we have pending data to write.
+                        let mut events = epoll::Events::EPOLLIN;
+                        if !self.tx_buf.is_empty() {
+                            events |= epoll::Events::EPOLLOUT;
+                        }
                         if VhostUserVsockThread::epoll_modify(
                             self.epoll_fd,
                             self.stream.as_raw_fd(),
-                            epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                            events,
                         )
                         .is_err()
                         {
-                            if let Err(e) = VhostUserVsockThread::epoll_register(
-                                self.epoll_fd,
-                                self.stream.as_raw_fd(),
-                                epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
-                            ) {
-                                // TODO: let's move this logic out of this func, and handle it
-                                // properly
-                                error!("epoll_register failed: {e:?}, but proceed further.");
-                            }
-                        };
-                    }
+                            error!("Failed to re-enable EPOLLIN after WouldBlock");
+                        }
 
-                    // Update the rx_cnt with the amount of data in the vsock packet.
-                    self.rx_cnt += Wrapping(pkt.len());
-                    self.last_fwd_cnt = self.fwd_cnt;
+                        // We must consume the virtio descriptor, otherwise it will be
+                        // leaked. We can't return it empty, so we craft a harmless
+                        // CREDIT_UPDATE packet that the guest can safely ignore.
+                        pkt.set_op(VSOCK_OP_CREDIT_UPDATE);
+                        self.last_fwd_cnt = self.fwd_cnt;
+                    }
+                    Err(e) => {
+                        // A real error occurred.
+                        warn!("vsock: stream read error: {:?}", e);
+                        pkt.set_op(VSOCK_OP_RST);
+                    }
                 }
                 Ok(())
             }
@@ -231,48 +276,113 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
 
         match pkt.op() {
             VSOCK_OP_RESPONSE => {
-                if self.stream.is_hybrid_vsock() {
-                    // Confirmation for a host initiated connection
-                    // TODO: Handle stream write error in a better manner
-                    let response = format!("OK {}\n", self.peer_port);
-                    self.stream.write_all(response.as_bytes()).unwrap();
-                }
+                info!(
+                    "vsock: VSOCK_OP_RESPONSE received for connection lp={}, pp={} - connection acknowledged",
+                    self.local_port, self.peer_port
+                );
                 self.connect = true;
             }
             VSOCK_OP_RW => {
+                info!(
+                    "vsock: VSOCK_OP_RW received for connection lp={}, pp={}, data_len={}",
+                    self.local_port, self.peer_port, pkt.len()
+                );
                 // Data has to be written to the host-side stream
                 match pkt.data_slice() {
                     None => {
                         info!(
-                            "Dropping empty packet from guest (lp={}, pp={})",
+                            "vsock: No data slice available for VSOCK_OP_RW (lp={}, pp={})",
                             self.local_port, self.peer_port
                         );
                         return Ok(());
                     }
                     Some(buf) => {
+                        if pkt.len() == 0 {
+                            // Zero-length RW packet often indicates end of data
+                            info!(
+                                "vsock: Received zero-length VSOCK_OP_RW packet (lp={}, pp={}) - signalling empty response",
+                                self.local_port, self.peer_port
+                            );
+                            
+                            // For hybrid vsock, send a 0-length response to indicate EOF or None
+                            if self.stream.is_hybrid_vsock() {
+                                let len_bytes = (0u64).to_le_bytes();
+                                if let Err(e) = self.stream.write_all(&len_bytes) {
+                                    warn!(
+                                        "vsock: Failed to write zero-length header to Unix socket (lp={}, pp={}): {}",
+                                        self.local_port, self.peer_port, e
+                                    );
+                                } else {
+                                    info!(
+                                        "vsock: Successfully sent zero-length response to Unix socket (lp={}, pp={})",
+                                        self.local_port, self.peer_port
+                                    );
+                                }
+                            }
+                            return Ok(());
+                        }
+                        
+                        // Create a regular slice from VolatileSlice for logging
+                        let mut bytes = vec![0u8; buf.len()];
+                        buf.copy_to(&mut bytes[..]);
+                        
+                        // Log the raw data from guest with hex and ASCII representation
+                        let hex_dump = bytes
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let ascii_dump = bytes
+                            .iter()
+                            .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                            .collect::<String>();
+                        
+                        info!(
+                            "vsock: Writing {} bytes from guest to Unix socket (lp={}, pp={}): HEX=[{}] ASCII=[{}]",
+                            buf.len(), self.local_port, self.peer_port, hex_dump, ascii_dump
+                        );
                         if let Err(err) = self.send_bytes(buf) {
+                            warn!(
+                                "vsock: Failed to write {} bytes to Unix socket (lp={}, pp={}): {:?}",
+                                buf.len(), self.local_port, self.peer_port, err
+                            );
                             // TODO: Terminate this connection
                             dbg!("err:{:?}", err);
                             return Ok(());
+                        } else {
+                            info!(
+                                "vsock: Successfully wrote {} bytes from guest to Unix socket (lp={}, pp={})",
+                                buf.len(), self.local_port, self.peer_port
+                            );
                         }
                     }
                 }
             }
             VSOCK_OP_CREDIT_UPDATE => {
+                info!(
+                    "vsock: VSOCK_OP_CREDIT_UPDATE received for connection lp={}, pp={}",
+                    self.local_port, self.peer_port
+                );
                 // Already updated the credit
 
-                // Re-register the stream file descriptor for read and write events
+                // Re-register the stream file descriptor for read and write events.
+                // The read path might have disabled EPOLLIN, so we should only
+                // re-enable it if there isn't a pending Rw op.
+                let mut events = epoll::Events::EPOLLOUT;
+                if !self.rx_queue.contains(RxOps::Rw.bitmask()) {
+                    events |= epoll::Events::EPOLLIN;
+                }
                 if VhostUserVsockThread::epoll_modify(
                     self.epoll_fd,
                     self.stream.as_raw_fd(),
-                    epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                    events,
                 )
                 .is_err()
                 {
                     if let Err(e) = VhostUserVsockThread::epoll_register(
                         self.epoll_fd,
                         self.stream.as_raw_fd(),
-                        epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                        events,
                     ) {
                         // TODO: let's move this logic out of this func, and handle it properly
                         error!("epoll_register failed: {e:?}, but proceed further.");
@@ -280,19 +390,50 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
                 };
             }
             VSOCK_OP_CREDIT_REQUEST => {
+                info!(
+                    "vsock: VSOCK_OP_CREDIT_REQUEST received for connection lp={}, pp={}",
+                    self.local_port, self.peer_port
+                );
                 // Send back this connection's credit information
                 self.rx_queue.enqueue(RxOps::CreditUpdate);
             }
             VSOCK_OP_SHUTDOWN => {
+                info!(
+                    "vsock: VSOCK_OP_SHUTDOWN received for connection lp={}, pp={}",
+                    self.local_port, self.peer_port
+                );
                 // Shutdown this connection
                 let recv_off = pkt.flags() & VSOCK_FLAGS_SHUTDOWN_RCV != 0;
                 let send_off = pkt.flags() & VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
                 if recv_off && send_off && self.tx_buf.is_empty() {
                     self.rx_queue.enqueue(RxOps::Reset);
+                    
+                    // For hybrid vsock connections, shutdown the Unix socket write side
+                    // to signal EOF to the client when the vsock connection is being terminated
+                    if self.stream.is_hybrid_vsock() {
+                        if let Err(e) = self.stream.shutdown_write() {
+                            warn!(
+                                "vsock: Failed to shutdown write side of Unix socket during VSOCK_OP_SHUTDOWN (lp={}, pp={}): {:?}",
+                                self.local_port, self.peer_port, e
+                            );
+                        } else {
+                            info!(
+                                "vsock: Successfully shutdown write side of Unix socket during VSOCK_OP_SHUTDOWN (lp={}, pp={})",
+                                self.local_port, self.peer_port
+                            );
+                        }
+                    }
+                } else if send_off && self.tx_buf.is_empty() {
+                    self.rx_queue.enqueue(RxOps::Reset);
                 }
             }
-            _ => {}
+            _ => {
+                info!(
+                    "vsock: Unknown operation {} received for connection lp={}, pp={}",
+                    pkt.op(), self.local_port, self.peer_port
+                );
+            }
         }
 
         Ok(())
@@ -304,25 +445,84 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
     /// - Ok(cnt) where cnt is the number of bytes written to the stream
     /// - Err(Error::StreamWrite) if there was an error writing to the stream
     fn send_bytes<B: BitmapSlice>(&mut self, buf: &VolatileSlice<B>) -> Result<()> {
+        info!(
+            "vsock: send_bytes called with {} bytes (lp={}, pp={}), tx_buf_empty={}",
+            buf.len(), self.local_port, self.peer_port, self.tx_buf.is_empty()
+        );
+        
         if !self.tx_buf.is_empty() {
             // Data is already present in the buffer and the backend
             // is waiting for a EPOLLOUT event to flush it
+            info!(
+                "vsock: TX buffer not empty, pushing {} bytes to buffer (lp={}, pp={})",
+                buf.len(), self.local_port, self.peer_port
+            );
             return self.tx_buf.push(buf);
         }
 
         // Write data to the stream
+        info!(
+            "vsock: Attempting to write {} bytes directly to stream (lp={}, pp={})",
+            buf.len(), self.local_port, self.peer_port
+        );
 
         let written_count = match self.stream.write_volatile(buf) {
-            Ok(cnt) => cnt,
+            Ok(cnt) => {
+                if cnt > 0 {
+                    // Create a regular slice from VolatileSlice for logging
+                    let mut bytes = vec![0u8; cnt];
+                    if let Ok(partial_buf) = buf.subslice(0, cnt) {
+                        partial_buf.copy_to(&mut bytes[..]);
+                        
+                        let hex_dump = bytes
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let ascii_dump = bytes
+                            .iter()
+                            .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                            .collect::<String>();
+                        
+                        info!(
+                            "vsock: Successfully wrote {} bytes to Unix socket (lp={}, pp={}): HEX=[{}] ASCII=[{}]",
+                            cnt, self.local_port, self.peer_port, hex_dump, ascii_dump
+                        );
+                    } else {
+                        info!(
+                            "vsock: Successfully wrote {} bytes to stream (lp={}, pp={}) - hex logging failed",
+                            cnt, self.local_port, self.peer_port
+                        );
+                    }
+                } else {
+                    info!(
+                        "vsock: Successfully wrote {} bytes to stream (lp={}, pp={})",
+                        cnt, self.local_port, self.peer_port
+                    );
+                }
+                cnt
+            },
             Err(vm_memory::VolatileMemoryError::IOError(e)) => {
                 if e.kind() == ErrorKind::WouldBlock {
+                    info!(
+                        "vsock: Write would block, wrote 0 bytes (lp={}, pp={})",
+                        self.local_port, self.peer_port
+                    );
                     0
                 } else {
+                    warn!(
+                        "vsock: IO error writing to stream (lp={}, pp={}): {:?}",
+                        self.local_port, self.peer_port, e
+                    );
                     dbg!("send_bytes error: {:?}", e);
                     return Err(Error::StreamWrite);
                 }
             }
             Err(e) => {
+                warn!(
+                    "vsock: Memory error writing to stream (lp={}, pp={}): {:?}",
+                    self.local_port, self.peer_port, e
+                );
                 dbg!("send_bytes error: {:?}", e);
                 return Err(Error::StreamWrite);
             }
@@ -331,6 +531,11 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
         if written_count > 0 {
             // Increment forwarded count by number of bytes written to the stream
             self.fwd_cnt += Wrapping(written_count as u32);
+            
+            info!(
+                "vsock: Updated fwd_cnt to {} after writing {} bytes (lp={}, pp={})",
+                self.fwd_cnt.0, written_count, self.local_port, self.peer_port
+            );
 
             // At what point in available credits should we send a credit update.
             // This is set to 1/4th of the tx buffer size. If we keep it too low,
@@ -341,16 +546,31 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
                 .tx_buffer_size
                 .wrapping_sub((self.fwd_cnt - self.last_fwd_cnt).0);
             if free_space < self.tx_buffer_size / 4 {
+                info!(
+                    "vsock: Enqueueing credit update, free_space={} (lp={}, pp={})",
+                    free_space, self.local_port, self.peer_port
+                );
                 self.rx_queue.enqueue(RxOps::CreditUpdate);
             }
         }
 
         if written_count != buf.len() {
+            info!(
+                "vsock: Partial write: wrote {} of {} bytes, buffering remaining {} bytes (lp={}, pp={})",
+                written_count, buf.len(), buf.len() - written_count, self.local_port, self.peer_port
+            );
+            
             // Try to re-enable EPOLLOUT in case it is disabled when txbuf is empty.
+            // The read path might have disabled EPOLLIN, so we should only
+            // re-enable it if there isn't a pending Rw op.
+            let mut events = epoll::Events::EPOLLOUT;
+            if !self.rx_queue.contains(RxOps::Rw.bitmask()) {
+                events |= epoll::Events::EPOLLIN;
+            }
             if VhostUserVsockThread::epoll_modify(
                 self.epoll_fd,
                 self.stream.as_raw_fd(),
-                epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                events,
             )
             .is_err()
             {
@@ -359,6 +579,10 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
             return self.tx_buf.push(&buf.offset(written_count).unwrap());
         }
 
+        info!(
+            "vsock: Complete write: wrote all {} bytes to stream (lp={}, pp={})",
+            written_count, self.local_port, self.peer_port
+        );
         Ok(())
     }
 
@@ -619,6 +843,11 @@ mod tests {
         fn is_hybrid_vsock(&self) -> bool {
             true
         }
+
+        fn shutdown_write(&self) -> std::io::Result<()> {
+            // Dummy implementation for testing - just return Ok
+            Ok(())
+        }
     }
 
     #[test]
@@ -871,9 +1100,6 @@ mod tests {
         let peer_response = conn_local.send_pkt(&pkt);
         assert!(peer_response.is_ok());
         assert!(conn_local.connect);
-        let mut resp_buf = vec![0; 8];
-        host_socket.read_exact(&mut resp_buf).unwrap();
-        assert_eq!(&resp_buf, b"OK 5001\n");
 
         // VSOCK_OP_RW
         pkt.set_op(VSOCK_OP_RW);

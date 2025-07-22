@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, Read},
     iter::FromIterator,
     num::Wrapping,
     ops::Deref,
@@ -18,7 +18,7 @@ use std::{
     thread,
 };
 
-use log::{error, warn};
+use log::{error, info, warn};
 use vhost_user_backend::{VringEpollHandler, VringRwLock, VringT};
 use virtio_queue::QueueOwnedT;
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
@@ -35,13 +35,14 @@ use crate::{
     thread_backend::*,
     vhu_vsock::{
         BackendType, CidMap, ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT,
-        SIBLING_VM_EVENT, VSOCK_HOST_CID,
+        SIBLING_VM_EVENT, VSOCK_HOST_CID, VSOCK_OP_RW, VSOCK_TYPE_STREAM,
     },
     vsock_conn::*,
 };
 
 type ArcVhostBknd = Arc<VhostUserVsockBackend>;
 
+#[derive(PartialEq, Debug)]
 enum RxQueueType {
     Standard,
     RawPkts,
@@ -92,6 +93,58 @@ pub(crate) struct VhostUserVsockThread {
 }
 
 impl VhostUserVsockThread {
+    /// Detect and strip vhost headers from Unix socket data
+    /// Returns (payload_data, payload_size) where payload_data is the data without headers
+    fn strip_vhost_headers_if_present<'a>(buffer: &'a [u8]) -> (&'a [u8], usize) {
+        // Check if the buffer might contain a vhost header
+        if buffer.len() < PKT_HEADER_SIZE {
+            // Too small to contain a vhost header, return as-is
+            return (buffer, buffer.len());
+        }
+
+        // Try to parse as a vhost packet header to detect if it's actually a vhost packet
+        // Vhost headers have a specific structure - check if this looks like one
+        let potential_header = &buffer[..PKT_HEADER_SIZE];
+        
+        // Extract fields from potential header
+        let src_cid = u64::from_le_bytes(potential_header[0..8].try_into().unwrap_or([0; 8]));
+        let dst_cid = u64::from_le_bytes(potential_header[8..16].try_into().unwrap_or([0; 8]));
+        let _src_port = u32::from_le_bytes(potential_header[16..20].try_into().unwrap_or([0; 4]));
+        let _dst_port = u32::from_le_bytes(potential_header[20..24].try_into().unwrap_or([0; 4]));
+        let len = u32::from_le_bytes(potential_header[24..28].try_into().unwrap_or([0; 4]));
+        let pkt_type = u16::from_le_bytes(potential_header[28..30].try_into().unwrap_or([0; 2]));
+        let op = u16::from_le_bytes(potential_header[30..32].try_into().unwrap_or([0; 2]));
+        
+        // Heuristics to detect if this is actually a vhost header:
+        // 1. CIDs should be reasonable values (not random garbage)
+        // 2. Length should match remaining buffer size
+        // 3. Packet type should be valid (VSOCK_TYPE_STREAM = 1)
+        // 4. Operation should be valid (1-7 are valid ops)
+        let looks_like_vhost_header = 
+            src_cid > 0 && src_cid < 0xFFFFFFFF &&  // Reasonable CID range
+            dst_cid > 0 && dst_cid < 0xFFFFFFFF &&  // Reasonable CID range  
+            len as usize == buffer.len() - PKT_HEADER_SIZE && // Length matches remaining data
+            pkt_type == crate::vhu_vsock::VSOCK_TYPE_STREAM && // Valid packet type
+            op >= 1 && op <= 7; // Valid operation code
+            
+        if looks_like_vhost_header {
+            info!(
+                "vsock: detected vhost header in Unix socket data, stripping {} bytes header",
+                PKT_HEADER_SIZE
+            );
+            
+            // Return payload without the header
+            (&buffer[PKT_HEADER_SIZE..], len as usize)
+        } else {
+            // Not a vhost header, return data as-is
+            info!(
+                "vsock: no vhost header detected in Unix socket data, forwarding {} bytes as-is",
+                buffer.len()
+            );
+            (buffer, buffer.len())
+        }
+    }
+
     /// Create a new instance of VhostUserVsockThread.
     pub fn new(
         backend_info: BackendType,
@@ -112,13 +165,50 @@ impl VhostUserVsockThread {
                 host_listeners_map.insert(host_sock, ListenerType::Unix(host_listener));
             }
             #[cfg(feature = "backend_vsock")]
+            BackendType::UnixToVsock(uds_path, _vsock_info) => {
+                info!(
+                    "vsock: [CID {}] creating Unix socket listener for forwarding to vsock at {}",
+                    guest_cid, uds_path.display()
+                );
+                // TODO: better error handling, maybe add a param to force the unlink
+                let _ = std::fs::remove_file(uds_path.clone());
+                let host_listener = UnixListener::bind(uds_path)
+                    .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
+                    .map_err(Error::UnixBind)?;
+                let host_sock = host_listener.as_raw_fd();
+                info!(
+                    "vsock: [CID {}] successfully created Unix socket listener with fd {}",
+                    guest_cid, host_sock
+                );
+                host_listeners_map.insert(host_sock, ListenerType::Unix(host_listener));
+            }
+            #[cfg(feature = "backend_vsock")]
             BackendType::Vsock(vsock_info) => {
                 for p in &vsock_info.listen_ports {
+                    info!(
+                        "vsock: [CID {}] creating vsock listener on port {}",
+                        guest_cid, p
+                    );
                     let host_listener = VsockListener::bind_with_cid_port(VMADDR_CID_ANY, *p)
                         .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
                         .map_err(Error::VsockBind)?;
                     let host_sock = host_listener.as_raw_fd();
+                    info!(
+                        "vsock: [CID {}] successfully created vsock listener on port {} with fd {}",
+                        guest_cid, p, host_sock
+                    );
                     host_listeners_map.insert(host_sock, ListenerType::Vsock(host_listener));
+                }
+                if vsock_info.listen_ports.is_empty() {
+                    info!(
+                        "vsock: [CID {}] no forward-listen ports configured",
+                        guest_cid
+                    );
+                } else {
+                    info!(
+                        "vsock: [CID {}] configured to accept host connections on ports: {:?}",
+                        guest_cid, vsock_info.listen_ports
+                    );
                 }
             }
         }
@@ -183,7 +273,16 @@ impl VhostUserVsockThread {
         };
 
         for host_raw_fd in thread.host_listeners_map.keys() {
-            VhostUserVsockThread::epoll_register(epoll_fd, *host_raw_fd, epoll::Events::EPOLLIN)?;
+            info!("vsock: [CID {}] registering host listener fd {} with epoll fd {}", guest_cid, host_raw_fd, epoll_fd);
+            match VhostUserVsockThread::epoll_register(epoll_fd, *host_raw_fd, epoll::Events::EPOLLIN) {
+                Ok(()) => {
+                    info!("vsock: [CID {}] successfully registered host listener fd {} with epoll", guest_cid, host_raw_fd);
+                }
+                Err(e) => {
+                    error!("vsock: [CID {}] failed to register host listener fd {} with epoll: {:?}", guest_cid, host_raw_fd, e);
+                    return Err(e);
+                }
+            }
         }
 
         Ok(thread)
@@ -266,40 +365,265 @@ impl VhostUserVsockThread {
 
     /// Register our listeners in the VringEpollHandler
     pub fn register_listeners(&mut self, epoll_handler: Arc<VringEpollHandler<ArcVhostBknd>>) {
-        epoll_handler
-            .register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT))
-            .unwrap();
-        epoll_handler
-            .register_listener(
-                self.sibling_event_fd.as_raw_fd(),
-                EventSet::IN,
-                u64::from(SIBLING_VM_EVENT),
-            )
-            .unwrap();
+        info!("vsock: [CID {}] registering internal epoll fd {} as BACKEND_EVENT with main epoll handler", 
+            self.guest_cid, self.get_epoll_fd());
+        
+        match epoll_handler.register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT)) {
+            Ok(()) => {
+                info!("vsock: [CID {}] successfully registered BACKEND_EVENT", self.guest_cid);
+            }
+            Err(e) => {
+                error!("vsock: [CID {}] failed to register BACKEND_EVENT: {:?}", self.guest_cid, e);
+            }
+        }
+        
+        info!("vsock: [CID {}] registering sibling event fd {} as SIBLING_VM_EVENT with main epoll handler", 
+            self.guest_cid, self.sibling_event_fd.as_raw_fd());
+            
+        match epoll_handler.register_listener(
+            self.sibling_event_fd.as_raw_fd(),
+            EventSet::IN,
+            u64::from(SIBLING_VM_EVENT),
+        ) {
+            Ok(()) => {
+                info!("vsock: [CID {}] successfully registered SIBLING_VM_EVENT", self.guest_cid);
+            }
+            Err(e) => {
+                error!("vsock: [CID {}] failed to register SIBLING_VM_EVENT: {:?}", self.guest_cid, e);
+            }
+        }
+    }
+
+    /// Process backend events in proxy mode (no guest VM)
+    fn process_backend_evt_proxy(&mut self) {
+        info!(
+            "vsock: [CID {}] processing backend events in proxy mode",
+            self.thread_backend.guest_cid
+        );
+
+        let mut epoll_events = vec![epoll::Event::new(epoll::Events::empty(), 0); 32];
+
+        match epoll::wait(self.epoll_file.as_raw_fd(), 0, epoll_events.as_mut_slice()) {
+            Ok(ev_cnt) => {
+                for i in 0..ev_cnt {
+                    let fd = epoll_events[i].data as RawFd;
+                    let evset = epoll::Events::from_bits_truncate(epoll_events[i].events);
+
+                    if let Some(key) = self.thread_backend.listener_map.get(&fd) {
+                        info!(
+                            "vsock: [CID {}] proxy backend event for connection {:?}",
+                            self.thread_backend.guest_cid, key
+                        );
+
+                        // Handle Unix socket data
+                        if evset.contains(epoll::Events::EPOLLIN) {
+                            // Data available to read from Unix socket
+                            // We need to package it as vsock packets and send to the peer
+                            info!(
+                                "vsock: [CID {}] data available on Unix socket",
+                                self.thread_backend.guest_cid
+                            );
+
+                            if let Some(conn) = self.thread_backend.conn_map.get_mut(&key) {
+                                let mut buffer = vec![0u8; 4096];
+                                match conn.stream.read(&mut buffer) {
+                                    Ok(0) => {
+                                        // Connection closed
+                                        info!(
+                                            "vsock: [CID {}] Unix socket closed by peer",
+                                            self.thread_backend.guest_cid
+                                        );
+                                        // TODO: Send VSOCK_OP_SHUTDOWN
+                                    }
+                                    Ok(n) => {
+                                        // Check for and strip vhost headers if present
+                                        let raw_data = &buffer[..n];
+                                        let (payload_data, payload_len) = Self::strip_vhost_headers_if_present(raw_data);
+                                        
+                                        info!(
+                                            "vsock: [CID {}] read {} bytes from Unix socket (payload: {} bytes after header processing)",
+                                            self.thread_backend.guest_cid, n, payload_len
+                                        );
+
+                                        // Send data back to vsock peer
+                                        // For proxy connections, guest_cid is the peer from host perspective
+                                        if let Some((peer_queue, _, peer_event_fd)) = self
+                                            .thread_backend
+                                            .cid_map
+                                            .read()
+                                            .unwrap()
+                                            .get(&conn.guest_cid)
+                                        {
+                                            let mut response = RawVsockPacket {
+                                                header: [0; PKT_HEADER_SIZE],
+                                                data: payload_data.to_vec(),
+                                            };
+
+                                            // Build VSOCK_OP_RW packet
+                                            // In proxy mode: local_cid is host (CID 3), guest_cid is peer (CID 16)
+                                            response.header[0..8].copy_from_slice(
+                                                &self.thread_backend.guest_cid.to_le_bytes(),
+                                            ); // src_cid (CID 3)
+                                            response.header[8..16]
+                                                .copy_from_slice(&conn.guest_cid.to_le_bytes()); // dst_cid (peer)
+                                            response.header[16..20]
+                                                .copy_from_slice(&conn.local_port.to_le_bytes()); // src_port
+                                            response.header[20..24]
+                                                .copy_from_slice(&conn.peer_port.to_le_bytes()); // dst_port
+                                            response.header[24..28]
+                                                .copy_from_slice(&(payload_len as u32).to_le_bytes()); // len
+                                            response.header[28..30]
+                                                .copy_from_slice(&VSOCK_TYPE_STREAM.to_le_bytes()); // type
+                                            response.header[30..32]
+                                                .copy_from_slice(&VSOCK_OP_RW.to_le_bytes()); // op
+                                            response.header[32..36]
+                                                .copy_from_slice(&0u32.to_le_bytes()); // flags
+                                            response.header[36..40].copy_from_slice(
+                                                &conn.tx_buf.get_buf_size().to_le_bytes(),
+                                            ); // buf_alloc
+                                            response.header[40..44]
+                                                .copy_from_slice(&conn.fwd_cnt.0.to_le_bytes()); // fwd_cnt
+
+                                            peer_queue.write().unwrap().push_back(response);
+                                            let _ = peer_event_fd.write(1);
+
+                                            info!(
+                                                "vsock: [CID {}] sent {} bytes to CID {} (after header stripping)",
+                                                self.thread_backend.guest_cid, payload_len, conn.guest_cid
+                                            );
+                                        }
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                        // No data available yet
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "vsock: [CID {}] error reading from Unix socket: {:?}",
+                                            self.thread_backend.guest_cid, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        if evset.contains(epoll::Events::EPOLLHUP) {
+                            // Connection closed
+                            info!(
+                                "vsock: [CID {}] Unix socket connection closed",
+                                self.thread_backend.guest_cid
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    error!(
+                        "vsock: [CID {}] epoll_wait error in proxy mode: {:?}",
+                        self.thread_backend.guest_cid, e
+                    );
+                }
+            }
+        }
     }
 
     /// Process a BACKEND_EVENT received by VhostUserVsockBackend.
     pub fn process_backend_evt(&mut self, _evset: EventSet) {
+        info!(
+            "vsock: [CID {}] *** process_backend_evt called *** evset={:?}",
+            self.thread_backend.guest_cid, _evset
+        );
+
+        // If no memory is configured, we're in proxy mode
+        if self.mem.is_none() {
+            info!(
+                "vsock: [CID {}] no guest memory configured, processing in proxy mode",
+                self.thread_backend.guest_cid
+            );
+            self.process_backend_evt_proxy();
+            return;
+        }
+
+        info!(
+            "vsock: [CID {}] guest memory configured, processing epoll events",
+            self.thread_backend.guest_cid
+        );
+        info!(
+            "vsock: [CID {}] about to call epoll_wait on fd {} with {} host listeners registered", 
+            self.thread_backend.guest_cid, 
+            self.epoll_file.as_raw_fd(),
+            self.host_listeners_map.len()
+        );
+        
         let mut epoll_events = vec![epoll::Event::new(epoll::Events::empty(), 0); 32];
         'epoll: loop {
+            info!(
+                "vsock: [CID {}] calling epoll_wait(fd={}, timeout=0) with {} registered fds", 
+                self.thread_backend.guest_cid, 
+                self.epoll_file.as_raw_fd(),
+                self.host_listeners_map.len()
+            );
+            
             match epoll::wait(self.epoll_file.as_raw_fd(), 0, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
-                    for evt in epoll_events.iter().take(ev_cnt) {
-                        self.handle_event(
-                            evt.data as RawFd,
-                            epoll::Events::from_bits(evt.events).unwrap(),
+                    info!(
+                        "vsock: [CID {}] epoll_wait returned {} events",
+                        self.thread_backend.guest_cid, ev_cnt
+                    );
+                    
+                    if ev_cnt == 0 {
+                        info!(
+                            "vsock: [CID {}] no epoll events detected - breaking from loop", 
+                            self.thread_backend.guest_cid
                         );
+                        break 'epoll;
+                    }
+                    
+                    for evt in epoll_events.iter().take(ev_cnt) {
+                        let fd = evt.data as RawFd;
+                        let events = evt.events;
+                        
+                        info!(
+                            "vsock: [CID {}] processing epoll event: fd={}, events={:?} (raw={})",
+                            self.thread_backend.guest_cid, fd, epoll::Events::from_bits(events), events
+                        );
+                        
+                        // Check if this fd is one of our host listeners
+                        if self.host_listeners_map.contains_key(&fd) {
+                            info!(
+                                "vsock: [CID {}] *** HOST LISTENER EVENT DETECTED *** fd={}", 
+                                self.thread_backend.guest_cid, fd
+                            );
+                        } else {
+                            info!(
+                                "vsock: [CID {}] event for non-host-listener fd={}", 
+                                self.thread_backend.guest_cid, fd
+                            );
+                        }
+                        
+                        self.handle_event(fd, epoll::Events::from_bits(events).unwrap());
                     }
                 }
                 Err(e) => {
                     if e.kind() == io::ErrorKind::Interrupted {
+                        info!(
+                            "vsock: [CID {}] epoll_wait interrupted, continuing", 
+                            self.thread_backend.guest_cid
+                        );
                         continue;
                     }
-                    warn!("failed to consume new epoll event");
+                    warn!(
+                        "vsock: [CID {}] epoll_wait error: {:?}",
+                        self.thread_backend.guest_cid, e
+                    );
                 }
             }
             break 'epoll;
         }
+        info!(
+            "vsock: [CID {}] finished processing backend events",
+            self.thread_backend.guest_cid
+        );
     }
 
     /// Handle a BACKEND_EVENT by either accepting a new connection or
@@ -311,16 +635,50 @@ impl VhostUserVsockThread {
                 ListenerType::Unix(unix_listener) => {
                     let conn = unix_listener.accept().map_err(Error::UnixAccept);
                     if self.mem.is_some() {
-                        conn.and_then(|(stream, _)| {
-                            stream
-                                .set_nonblocking(true)
-                                .map(|_| stream)
-                                .map_err(Error::UnixAccept)
-                        })
-                        .and_then(|stream| self.add_stream_listener(stream))
-                        .unwrap_or_else(|err| {
-                            warn!("Unable to accept new local connection: {err:?}");
-                        });
+                        match &self.backend_info {
+                            BackendType::UnixDomainSocket(_) => {
+                                // Traditional mode - add stream listener and wait for CONNECT command
+                                conn.and_then(|(stream, _)| {
+                                    stream
+                                        .set_nonblocking(true)
+                                        .map(|_| stream)
+                                        .map_err(Error::UnixAccept)
+                                })
+                                .and_then(|stream| self.add_stream_listener(stream))
+                                .unwrap_or_else(|err| {
+                                    warn!("Unable to accept new local connection: {err:?}");
+                                });
+                            }
+                            #[cfg(feature = "backend_vsock")]
+                            BackendType::UnixToVsock(_, vsock_info) => {
+                                // Forward mode - create virtual connection through vhost-user protocol
+                                info!(
+                                    "vsock: [CID {}] Unix socket connection received, creating virtual connection to guest CID {} port {}",
+                                    self.thread_backend.guest_cid, vsock_info.target_cid, vsock_info.target_port
+                                );
+                                
+                                match conn {
+                                    Ok((unix_stream, _)) => {
+                                        if let Err(err) = unix_stream.set_nonblocking(true) {
+                                            warn!("Failed to set Unix stream to non-blocking: {err:?}");
+                                            return;
+                                        }
+                                        
+                                        // Create a virtual vhost-user connection 
+                                        // We'll act as if this is a host-initiated connection TO the guest
+                                        if let Err(err) = self.setup_unix_to_guest_proxy(unix_stream, vsock_info.target_cid, vsock_info.target_port) {
+                                            warn!("Failed to setup Unix to guest proxy: {err:?}");
+                                        }
+                                    }
+                                    Err(err) => {
+                                        warn!("Failed to accept Unix socket connection: {err:?}");
+                                    }
+                                }
+                            }
+                            _ => {
+                                warn!("Unexpected backend type for Unix listener");
+                            }
+                        }
                     } else {
                         // If we aren't ready to process requests, accept and immediately close
                         // the connection.
@@ -331,17 +689,35 @@ impl VhostUserVsockThread {
                 }
                 #[cfg(feature = "backend_vsock")]
                 ListenerType::Vsock(vsock_listener) => {
+                    info!(
+                        "vsock: [CID {}] received connection on vsock listener fd {}",
+                        self.thread_backend.guest_cid, fd
+                    );
                     let conn = vsock_listener.accept().map_err(Error::VsockAccept);
                     if self.mem.is_some() {
                         match conn {
                             Ok((stream, addr)) => {
+                                info!(
+                                    "vsock: [CID {}] accepted connection from CID {} port {}",
+                                    self.thread_backend.guest_cid,
+                                    addr.cid(),
+                                    addr.port()
+                                );
+
                                 if let Err(err) = stream.set_nonblocking(true) {
                                     warn!("Failed to set stream to non-blocking: {err:?}");
                                     return;
                                 }
 
                                 let peer_port = match vsock_listener.local_addr() {
-                                    Ok(listener_addr) => listener_addr.port(),
+                                    Ok(listener_addr) => {
+                                        info!(
+                                            "vsock: [CID {}] listener bound to port {}",
+                                            self.thread_backend.guest_cid,
+                                            listener_addr.port()
+                                        );
+                                        listener_addr.port()
+                                    }
                                     Err(err) => {
                                         warn!("Failed to get peer address: {err:?}");
                                         return;
@@ -350,6 +726,9 @@ impl VhostUserVsockThread {
 
                                 let local_port = addr.port();
                                 let stream_raw_fd = stream.as_raw_fd();
+                                info!("vsock: [CID {}] adding new host connection: local_port={}, peer_port={}, stream_fd={}", 
+                                    self.thread_backend.guest_cid, local_port, peer_port, stream_raw_fd);
+
                                 self.add_new_connection_from_host(
                                     stream_raw_fd,
                                     StreamType::Vsock(stream),
@@ -362,17 +741,222 @@ impl VhostUserVsockThread {
                                     epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
                                 ) {
                                     warn!("Failed to register with epoll: {err:?}");
+                                } else {
+                                    info!("vsock: [CID {}] successfully registered stream_fd {} with epoll", 
+                                        self.thread_backend.guest_cid, stream_raw_fd);
                                 }
                             }
                             Err(err) => {
-                                warn!("Unable to accept new local connection: {err:?}");
+                                warn!(
+                                    "vsock: [CID {}] failed to accept connection on fd {}: {:?}",
+                                    self.thread_backend.guest_cid, fd, err
+                                );
                             }
                         }
                     } else {
+                        info!("vsock: [CID {}] no guest VM memory configured - closing incoming connection", 
+                            self.thread_backend.guest_cid);
+                        // If we aren't ready to process requests, accept and immediately close
+                        // the connection.
                         conn.map(drop).unwrap_or_else(|err| {
                             warn!("Error closing an incoming connection: {err:?}");
                         });
                     }
+                }
+            }
+        } else if let Some(key) = self.thread_backend.listener_map.get(&fd).cloned() {
+            // This might be a forwarding connection OR a Unix socket proxy connection
+            info!(
+                "vsock: [CID {}] received event on fd {} with key {:?}",
+                self.thread_backend.guest_cid, fd, key
+            );
+            
+            info!(
+                "vsock: [CID {}] DEBUG: evset={:?}, EPOLLOUT={:?}, contains_EPOLLOUT={}",
+                self.thread_backend.guest_cid, evset, epoll::Events::EPOLLOUT, evset.contains(epoll::Events::EPOLLOUT)
+            );
+            
+            // Handle EPOLLHUP first - if the connection is closed, clean up immediately
+            if evset.contains(epoll::Events::EPOLLHUP) {
+                // But first, check if there's data to read with the HUP
+                if evset.contains(epoll::Events::EPOLLIN) {
+                    info!(
+                        "vsock: [CID {}] Unix socket proxy fd {} has both EPOLLIN and EPOLLHUP - reading final data first",
+                        self.thread_backend.guest_cid, fd
+                    );
+                    
+                    // Try to read any final data before closing
+                    if let Some(conn) = self.thread_backend.conn_map.get_mut(&key) {
+                        let mut buffer = [0u8; 4096];
+                        match conn.stream.read(&mut buffer) {
+                            Ok(0) => {
+                                info!(
+                                    "vsock: [CID {}] No final data to read from fd {} before close",
+                                    self.thread_backend.guest_cid, fd
+                                );
+                            }
+                            Ok(n) => {
+                                info!(
+                                    "vsock: [CID {}] Read {} final bytes from fd {} before close: {:?}",
+                                    self.thread_backend.guest_cid, fd, n, &buffer[..n]
+                                );
+                                // Process this final data if needed
+                            }
+                            Err(e) => {
+                                info!(
+                                    "vsock: [CID {}] Error reading final data from fd {}: {:?}",
+                                    self.thread_backend.guest_cid, fd, e
+                                );
+                            }
+                        }
+                        
+                        // Send EOF to complete the conversation
+                        if conn.stream.is_hybrid_vsock() {
+                            if let Err(e) = conn.stream.shutdown_write() {
+                                warn!(
+                                    "vsock: [CID {}] Failed to shutdown write when client closed connection: {:?}",
+                                    self.thread_backend.guest_cid, e
+                                );
+                            } else {
+                                info!(
+                                    "vsock: [CID {}] Successfully shutdown write after client closed connection - EOF sent",
+                                    self.thread_backend.guest_cid
+                                );
+                            }
+                        }
+                    }
+                }
+                
+                info!(
+                    "vsock: [CID {}] Unix socket proxy fd {} closed by client",
+                    self.thread_backend.guest_cid, fd
+                );
+                self.cleanup_unix_proxy_connection(fd, &key);
+                return; // Return immediately after cleanup to avoid processing other events
+            }
+            
+            // Check if this is a Unix socket proxy connection
+            info!(
+                "vsock: [CID {}] DEBUG: checking conn_map for key {:?}, found={}",
+                self.thread_backend.guest_cid, key, self.thread_backend.conn_map.contains_key(&key)
+            );
+            
+            if let Some(conn) = self.thread_backend.conn_map.get_mut(&key) {
+                info!(
+                    "vsock: [CID {}] DEBUG: found connection for key {:?}, processing events",
+                    self.thread_backend.guest_cid, key
+                );
+                // This is a Unix socket proxy connection - handle data normally
+                if evset.contains(epoll::Events::EPOLLIN) {
+                    info!(
+                        "vsock: [CID {}] data available on Unix socket proxy fd {}, queuing forward to guest",
+                        self.thread_backend.guest_cid, fd
+                    );
+
+                    // Don't read from the socket here. Instead, just queue an `Rw`
+                    // operation. The actual read will happen in `conn.recv_pkt`
+                    // when a virtio buffer is available from the guest.
+
+                    // Queue an RW operation to send the data to guest
+                    conn.rx_queue.enqueue(crate::rxops::RxOps::Rw);
+
+                    // Add to backend RX queue for processing
+                    self.thread_backend.backend_rxq.push_back(key.clone());
+
+                    info!(
+                        "vsock: [CID {}] enqueued Rw op for fd {}, disabling EPOLLIN to prevent busy-loop",
+                        self.thread_backend.guest_cid, fd,
+                    );
+
+                    // To prevent a busy-loop where we continuously queue `Rw` ops
+                    // for the same data, we need to stop listening for `EPOLLIN`
+                    // until the read has actually been performed. We'll re-enable
+                    // it in `VsockConnection::recv_pkt`.
+                    if let Err(err) = Self::epoll_modify(
+                        self.get_epoll_fd(),
+                        fd,
+                        epoll::Events::empty(), // Stop listening for now
+                    ) {
+                        warn!(
+                            "vsock: [CID {}] failed to disable EPOLLIN for fd {}: {:?}",
+                            self.thread_backend.guest_cid, fd, err
+                        );
+                    }
+                }
+                
+                // Handle EPOLLOUT events for Unix proxy connections
+                if evset.contains(epoll::Events::EPOLLOUT) {
+                    info!(
+                        "vsock: [CID {}] EPOLLOUT event on Unix socket proxy fd {} - removing EPOLLOUT from registration",
+                        self.thread_backend.guest_cid, fd
+                    );
+                    
+                    // Modify epoll registration to only listen for EPOLLIN events
+                    if let Err(err) = Self::epoll_modify(
+                        self.get_epoll_fd(),
+                        fd,
+                        epoll::Events::EPOLLIN, // Only listen for input events
+                    ) {
+                        warn!(
+                            "vsock: [CID {}] failed to modify epoll registration for fd {}: {:?}",
+                            self.thread_backend.guest_cid, fd, err
+                        );
+                        
+                        // If epoll_modify fails, try to unregister completely to prevent infinite loops
+                        warn!(
+                            "vsock: [CID {}] attempting to unregister fd {} completely due to epoll_modify failure",
+                            self.thread_backend.guest_cid, fd
+                        );
+                        
+                        if let Err(unreg_err) = Self::epoll_unregister(self.get_epoll_fd(), fd) {
+                            error!(
+                                "vsock: [CID {}] failed to unregister fd {} from epoll: {:?} - this may cause infinite loops",
+                                self.thread_backend.guest_cid, fd, unreg_err
+                            );
+                        } else {
+                            info!(
+                                "vsock: [CID {}] successfully unregistered fd {} from epoll as fallback",
+                                self.thread_backend.guest_cid, fd
+                            );
+                            // Clean up the connection since we unregistered it
+                            self.cleanup_unix_proxy_connection(fd, &key);
+                            return;
+                        }
+                    } else {
+                        info!(
+                            "vsock: [CID {}] successfully modified epoll registration for fd {} to EPOLLIN only",
+                            self.thread_backend.guest_cid, fd
+                        );
+                    }
+                }
+                
+                // Catch-all for unexpected events
+                if !evset.contains(epoll::Events::EPOLLIN) && 
+                   !evset.contains(epoll::Events::EPOLLOUT) && 
+                   !evset.contains(epoll::Events::EPOLLHUP) {
+                    warn!(
+                        "vsock: [CID {}] unexpected event on Unix socket proxy fd {}: {:?}",
+                        self.thread_backend.guest_cid, fd, evset
+                    );
+                }
+            } else {
+                // Connection not found in conn_map - this shouldn't happen after proper cleanup
+                warn!(
+                    "vsock: [CID {}] received event for fd {} but connection not found in conn_map - cleaning up stale listener",
+                    self.thread_backend.guest_cid, fd
+                );
+                warn!(
+                    "vsock: [CID {}] DEBUG: evset was {:?}, this might be causing the infinite loop",
+                    self.thread_backend.guest_cid, evset
+                );
+                
+                // Remove stale listener entry and unregister from epoll
+                self.thread_backend.listener_map.remove(&fd);
+                if let Err(err) = Self::epoll_unregister(self.get_epoll_fd(), fd) {
+                    warn!(
+                        "vsock: [CID {}] failed to unregister stale fd {} from epoll: {:?}",
+                        self.thread_backend.guest_cid, fd, err
+                    );
                 }
             }
         } else {
@@ -381,9 +965,36 @@ impl VhostUserVsockThread {
             if let std::collections::hash_map::Entry::Vacant(_) =
                 self.thread_backend.listener_map.entry(fd)
             {
+                // Check if this is a stale fd that's still registered in epoll
+                // but not in our tracking maps - this can cause infinite loops
+                if evset.contains(epoll::Events::EPOLLOUT) || evset.contains(epoll::Events::EPOLLHUP) {
+                    warn!(
+                        "vsock: [CID {}] received event {:?} for untracked fd {} - unregistering from epoll to prevent infinite loop",
+                        self.thread_backend.guest_cid, evset, fd
+                    );
+                    
+                    // Unregister the stale fd from epoll
+                    if let Err(err) = Self::epoll_unregister(self.get_epoll_fd(), fd) {
+                        warn!(
+                            "vsock: [CID {}] failed to unregister stale fd {} from epoll: {:?}",
+                            self.thread_backend.guest_cid, fd, err
+                        );
+                    } else {
+                        info!(
+                            "vsock: [CID {}] successfully unregistered stale fd {} from epoll",
+                            self.thread_backend.guest_cid, fd
+                        );
+                    }
+                    return;
+                }
+                
                 // New connection from the host
                 if evset.bits() != epoll::Events::EPOLLIN.bits() {
                     // Has to be EPOLLIN as it was not connected previously
+                    warn!(
+                        "vsock: [CID {}] unexpected event {:?} for new connection fd {} - ignoring",
+                        self.thread_backend.guest_cid, evset, fd
+                    );
                     return;
                 }
                 let mut stream = match self.thread_backend.stream_map.remove(&fd) {
@@ -446,9 +1057,42 @@ impl VhostUserVsockThread {
                                 conn.rx_queue.enqueue(RxOps::CreditUpdate);
                             } else {
                                 // If no remaining data to flush, try to disable EPOLLOUT
-                                if Self::epoll_modify(epoll_fd, fd, epoll::Events::EPOLLIN).is_err()
-                                {
-                                    error!("Failed to disable EPOLLOUT");
+                                if let Err(err) = Self::epoll_modify(epoll_fd, fd, epoll::Events::EPOLLIN) {
+                                    error!(
+                                        "vsock: [CID {}] failed to disable EPOLLOUT for fd {}: {:?}",
+                                        self.thread_backend.guest_cid, fd, err
+                                    );
+                                    
+                                    // As a fallback, try to unregister completely to prevent infinite loops
+                                    warn!(
+                                        "vsock: [CID {}] attempting to unregister fd {} completely due to epoll_modify failure",
+                                        self.thread_backend.guest_cid, fd
+                                    );
+                                    
+                                    if let Err(unreg_err) = Self::epoll_unregister(epoll_fd, fd) {
+                                        error!(
+                                            "vsock: [CID {}] failed to unregister fd {} from epoll: {:?} - this may cause infinite loops",
+                                            self.thread_backend.guest_cid, fd, unreg_err
+                                        );
+                                    } else {
+                                        info!(
+                                            "vsock: [CID {}] successfully unregistered fd {} from epoll as fallback",
+                                            self.thread_backend.guest_cid, fd
+                                        );
+                                        
+                                        // Clean up the connection since we unregistered it
+                                        let key = key.clone();
+                                        let conn = self.thread_backend.conn_map.remove(&key).unwrap();
+                                        self.thread_backend.listener_map.remove(&fd);
+                                        self.thread_backend.stream_map.remove(&fd);
+                                        self.thread_backend.local_port_set.remove(&conn.local_port);
+                                        return;
+                                    }
+                                } else {
+                                    info!(
+                                        "vsock: [CID {}] successfully disabled EPOLLOUT for fd {}",
+                                        self.thread_backend.guest_cid, fd
+                                    );
                                 }
                             }
                             self.thread_backend
@@ -456,7 +1100,10 @@ impl VhostUserVsockThread {
                                 .push_back(ConnMapKey::new(conn.local_port, conn.peer_port));
                         }
                         Err(e) => {
-                            dbg!("Error: {:?}", e);
+                            error!(
+                                "vsock: [CID {}] error flushing tx buffer for fd {}: {:?}",
+                                self.thread_backend.guest_cid, fd, e
+                            );
                         }
                     }
                     return;
@@ -473,6 +1120,11 @@ impl VhostUserVsockThread {
                     .push_back(ConnMapKey::new(conn.local_port, conn.peer_port));
             }
         }
+        
+        info!(
+            "vsock: [CID {}] DEBUG: handle_event for fd {} completed",
+            self.thread_backend.guest_cid, fd
+        );
     }
 
     fn add_new_connection_from_host(
@@ -482,6 +1134,11 @@ impl VhostUserVsockThread {
         local_port: u32,
         peer_port: u32,
     ) {
+        info!(
+            "vsock: [CID {}] add_new_connection_from_host: fd={}, local_port={}, peer_port={}",
+            self.thread_backend.guest_cid, fd, local_port, peer_port
+        );
+
         // Insert the fd into the backend's maps
         self.thread_backend
             .listener_map
@@ -502,12 +1159,22 @@ impl VhostUserVsockThread {
         new_conn.rx_queue.enqueue(RxOps::Request);
         new_conn.set_peer_port(peer_port);
 
+        info!(
+            "vsock: [CID {}] connection created with key {:?}, enqueuing connection request",
+            self.thread_backend.guest_cid, conn_map_key
+        );
+
         // Add connection object into the backend's maps
         self.thread_backend.conn_map.insert(conn_map_key, new_conn);
 
         self.thread_backend
             .backend_rxq
             .push_back(ConnMapKey::new(local_port, peer_port));
+
+        info!(
+            "vsock: [CID {}] connection added to maps and queued for processing",
+            self.thread_backend.guest_cid
+        );
     }
 
     /// Allocate a new local port number.
@@ -581,20 +1248,66 @@ impl VhostUserVsockThread {
 
     /// Iterate over the rx queue and process rx requests.
     fn process_rx_queue(&mut self, vring: &VringRwLock, rx_queue_type: RxQueueType) -> Result<()> {
+        info!(
+            "vsock: [CID {}] process_rx_queue called for {:?}",
+            self.thread_backend.guest_cid, rx_queue_type
+        );
+
         let atomic_mem = match &self.mem {
             Some(m) => m,
-            None => return Err(Error::NoMemoryConfigured),
+            None => {
+                info!(
+                    "vsock: [CID {}] ERROR: No memory configured for {:?}",
+                    self.thread_backend.guest_cid, rx_queue_type
+                );
+                return Err(Error::NoMemoryConfigured);
+            }
         };
+
+        info!(
+            "vsock: [CID {}] getting vring mutex for {:?}",
+            self.thread_backend.guest_cid, rx_queue_type
+        );
 
         let mut vring_mut = vring.get_mut();
 
+        info!(
+            "vsock: [CID {}] getting queue for {:?}",
+            self.thread_backend.guest_cid, rx_queue_type
+        );
+
         let queue = vring_mut.get_queue_mut();
 
-        while let Some(mut avail_desc) = queue
-            .iter(atomic_mem.memory())
-            .map_err(|_| Error::IterateQueue)?
-            .next()
-        {
+        info!(
+            "vsock: [CID {}] checking for available descriptors in {:?} queue",
+            self.thread_backend.guest_cid, rx_queue_type
+        );
+
+        let mut desc_count = 0;
+        let mut queue_iter = match queue.iter(atomic_mem.memory()) {
+            Ok(iter) => iter,
+            Err(e) => {
+                info!(
+                    "vsock: [CID {}] ERROR: Failed to create queue iterator for {:?}: {:?}",
+                    self.thread_backend.guest_cid, rx_queue_type, e
+                );
+                return Err(Error::IterateQueue);
+            }
+        };
+
+        info!(
+            "vsock: [CID {}] created queue iterator, checking for descriptors",
+            self.thread_backend.guest_cid
+        );
+
+        while let Some(mut avail_desc) = queue_iter.next() {
+            desc_count += 1;
+            if desc_count == 1 {
+                info!(
+                    "vsock: [CID {}] found available descriptor in rx queue for {:?}",
+                    self.thread_backend.guest_cid, rx_queue_type
+                );
+            }
             let mem = atomic_mem.clone().memory();
 
             let head_idx = avail_desc.head_index();
@@ -606,12 +1319,34 @@ impl VhostUserVsockThread {
                 Ok(mut pkt) => {
                     let recv_result = match rx_queue_type {
                         RxQueueType::Standard => self.thread_backend.recv_pkt(&mut pkt),
-                        RxQueueType::RawPkts => self.thread_backend.recv_raw_pkt(&mut pkt),
+                        RxQueueType::RawPkts => {
+                            info!(
+                                "vsock: [CID {}] processing raw packet from sibling VM",
+                                self.thread_backend.guest_cid
+                            );
+                            let result = self.thread_backend.recv_raw_pkt(&mut pkt);
+                            if let Err(ref e) = result {
+                                info!(
+                                    "vsock: [CID {}] recv_raw_pkt returned error: {:?}",
+                                    self.thread_backend.guest_cid, e
+                                );
+                            }
+                            result
+                        }
                     };
 
                     if recv_result.is_ok() {
+                        if rx_queue_type == RxQueueType::RawPkts {
+                            info!(
+                                "vsock: delivered raw pkt to guest - src_cid:{}, dst_cid:{}, op:{}, used_len:{}",
+                                pkt.src_cid(), pkt.dst_cid(), pkt.op(), PKT_HEADER_SIZE + pkt.len() as usize
+                            );
+                        }
                         PKT_HEADER_SIZE + pkt.len() as usize
                     } else {
+                        if rx_queue_type == RxQueueType::RawPkts {
+                            info!("vsock: no more raw packets to process");
+                        }
                         queue.iter(mem).unwrap().go_to_previous_position();
                         break;
                     }
@@ -646,6 +1381,21 @@ impl VhostUserVsockThread {
                 }
             }
         }
+
+        if desc_count == 0 {
+            info!("vsock: [CID {}] WARNING: No available descriptors in rx queue for {:?} - guest may not be ready to receive packets", 
+                self.thread_backend.guest_cid, rx_queue_type);
+            if rx_queue_type == RxQueueType::RawPkts {
+                info!("vsock: [CID {}] The guest VM needs to have the vsock driver loaded and running to receive inter-VM packets", 
+                    self.thread_backend.guest_cid);
+            }
+        } else {
+            info!(
+                "vsock: [CID {}] processed {} descriptors for {:?}",
+                self.thread_backend.guest_cid, desc_count, rx_queue_type
+            );
+        }
+
         Ok(())
     }
 
@@ -676,7 +1426,47 @@ impl VhostUserVsockThread {
 
     /// Wrapper to process raw vsock packets queue based on whether event idx is
     /// enabled or not.
+    /// Process raw packets in proxy mode (when there's no guest VM)
+    pub fn process_raw_pkts_as_proxy(&mut self) -> Result<()> {
+        info!(
+            "vsock: [CID {}] processing raw packets in Unix socket proxy mode",
+            self.thread_backend.guest_cid
+        );
+
+        while self.thread_backend.pending_raw_pkts() {
+            // We don't need to create a packet, just pass a dummy one
+            // The actual packet data will be read from the queue
+            match self.thread_backend.recv_raw_pkt_proxy() {
+                Ok(()) => {
+                    info!(
+                        "vsock: [CID {}] processed raw packet in proxy mode",
+                        self.thread_backend.guest_cid
+                    );
+                }
+                Err(e) => {
+                    if !matches!(e, Error::EmptyRawPktsQueue) {
+                        warn!(
+                            "vsock: [CID {}] error processing raw packet in proxy mode: {:?}",
+                            self.thread_backend.guest_cid, e
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn process_raw_pkts(&mut self, vring: &VringRwLock, event_idx: bool) -> Result<()> {
+        let pending_count = self.thread_backend.raw_pkts_queue.read().unwrap().len();
+        info!(
+            "vsock: [CID {}] process_raw_pkts called, pending: {}, queue size: {}",
+            self.thread_backend.guest_cid,
+            self.thread_backend.pending_raw_pkts(),
+            pending_count
+        );
+
         if event_idx {
             loop {
                 if !self.thread_backend.pending_raw_pkts() {
@@ -721,11 +1511,17 @@ impl VhostUserVsockThread {
 
     /// Process tx queue and send requests to the backend for processing.
     fn process_tx_queue(&mut self, vring: &VringRwLock) -> Result<()> {
+        info!(
+            "vsock: [CID {}] process_tx_queue called - checking for TX packets from guest",
+            self.thread_backend.guest_cid
+        );
+
         let atomic_mem = match &self.mem {
             Some(m) => m,
             None => return Err(Error::NoMemoryConfigured),
         };
 
+        let mut processed_count = 0;
         while let Some(mut avail_desc) = vring
             .get_mut()
             .get_queue_mut()
@@ -733,29 +1529,56 @@ impl VhostUserVsockThread {
             .map_err(|_| Error::IterateQueue)?
             .next()
         {
+            processed_count += 1;
             let mem = atomic_mem.clone().memory();
 
             let head_idx = avail_desc.head_index();
+            info!(
+                "vsock: [CID {}] processing TX descriptor #{} with head_idx={}",
+                self.thread_backend.guest_cid, processed_count, head_idx
+            );
+
             let pkt = match VsockPacket::from_tx_virtq_chain(
                 mem.deref(),
                 &mut avail_desc,
                 self.tx_buffer_size,
             ) {
-                Ok(pkt) => pkt,
+                Ok(pkt) => {
+                    info!(
+                        "vsock: [CID {}] successfully parsed TX packet #{} - src_cid:{}, src_port:{}, dst_cid:{}, dst_port:{}, op:{}, len:{}",
+                        self.thread_backend.guest_cid, processed_count, pkt.src_cid(), pkt.src_port(), pkt.dst_cid(), pkt.dst_port(), pkt.op(), pkt.len()
+                    );
+                    pkt
+                }
                 Err(e) => {
-                    dbg!("vsock: error reading TX packet: {:?}", e);
+                    warn!(
+                        "vsock: [CID {}] error reading TX packet #{}: {:?}",
+                        self.thread_backend.guest_cid, processed_count, e
+                    );
                     continue;
                 }
             };
 
-            if self.thread_backend.send_pkt(&pkt).is_err() {
-                vring
-                    .get_mut()
-                    .get_queue_mut()
-                    .iter(mem)
-                    .unwrap()
-                    .go_to_previous_position();
-                break;
+            match self.thread_backend.send_pkt(&pkt) {
+                Ok(()) => {
+                    info!(
+                        "vsock: [CID {}] successfully processed TX packet #{} via thread_backend.send_pkt",
+                        self.thread_backend.guest_cid, processed_count
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "vsock: [CID {}] thread_backend.send_pkt failed for TX packet #{}: {:?}",
+                        self.thread_backend.guest_cid, processed_count, e
+                    );
+                    vring
+                        .get_mut()
+                        .get_queue_mut()
+                        .iter(mem)
+                        .unwrap()
+                        .go_to_previous_position();
+                    break;
+                }
             }
 
             // TODO: Check if the protocol requires read length to be correct
@@ -771,6 +1594,20 @@ impl VhostUserVsockThread {
                     used_len,
                 })
                 .unwrap();
+        }
+
+        if processed_count == 0 {
+            // Only log at debug level since this is normal - process_tx_queue gets called 
+            // multiple times and finding no descriptors after initial processing is expected
+            info!(
+                "vsock: [CID {}] process_tx_queue found no TX descriptors (normal after processing)",
+                self.thread_backend.guest_cid
+            );
+        } else {
+            info!(
+                "vsock: [CID {}] process_tx_queue processed {} TX descriptors from guest",
+                self.thread_backend.guest_cid, processed_count
+            );
         }
 
         Ok(())
@@ -796,6 +1633,141 @@ impl VhostUserVsockThread {
         }
         Ok(())
     }
+
+    /// Set up Unix socket to guest proxy using vhost-user protocol
+    #[cfg(feature = "backend_vsock")]
+    fn setup_unix_to_guest_proxy(
+        &mut self,
+        unix_stream: UnixStream,
+        target_cid: u32,
+        target_port: u32,
+    ) -> Result<()> {
+        info!(
+            "vsock: [CID {}] setting up Unix socket to guest CID {} port {} proxy via vhost-user",
+            self.guest_cid, target_cid, target_port
+        );
+        
+        // Allocate a local port for this connection
+        let local_port = match self.allocate_local_port() {
+            Ok(port) => port,
+            Err(err) => {
+                warn!("vsock: [CID {}] failed to allocate local port: {:?}", self.guest_cid, err);
+                return Err(err);
+            }
+        };
+        
+        info!(
+            "vsock: [CID {}] allocated local port {} for Unix socket proxy to CID {} port {}",
+            self.guest_cid, local_port, target_cid, target_port
+        );
+        
+        // Create a connection entry for this proxy connection
+        let unix_fd = unix_stream.as_raw_fd();
+        let key = ConnMapKey::new(local_port, target_port);
+        
+        // Create the connection object - this will be used to handle data forwarding
+        // IMPORTANT: Use VSOCK_HOST_CID (2) as local_cid so the guest sees this as a host-initiated connection
+        let conn = VsockConnection::new_local_init(
+            StreamType::Unix(unix_stream.try_clone().map_err(Error::UnixConnect)?),
+            crate::vhu_vsock::VSOCK_HOST_CID, // local CID (make it appear to come from host)
+            local_port,     // local port
+            target_cid as u64,    // peer CID (guest)
+            target_port,    // peer port
+            self.get_epoll_fd(),
+            self.tx_buffer_size,
+        );
+        
+        // Register the Unix socket with epoll
+        Self::epoll_register(
+            self.get_epoll_fd(),
+            unix_fd,
+            epoll::Events::EPOLLIN, // Only register for input events initially
+        )?;
+        
+        // Store the connection in our maps
+        self.thread_backend.stream_map.insert(unix_fd, StreamType::Unix(unix_stream));
+        self.thread_backend.listener_map.insert(unix_fd, key.clone());
+        self.thread_backend.conn_map.insert(key.clone(), conn);
+        self.thread_backend.local_port_set.insert(local_port);
+        
+        // CRITICAL FIX: Set connect=true for UnixToVsock connections since they're already established
+        // This prevents recv_pkt from sending VSOCK_OP_RST when processing RxOps::Rw
+        if let Some(conn) = self.thread_backend.conn_map.get_mut(&key) {
+            conn.connect = true;
+        }
+        
+        info!(
+            "vsock: [CID {}] Unix socket proxy setup complete - Unix fd {} mapped to guest CID {} port {} via local port {}",
+            self.guest_cid, unix_fd, target_cid, target_port, local_port
+        );
+        
+        // Send connection request to guest via vhost-user protocol
+        self.send_connection_request_to_guest(target_cid, target_port, local_port)?;
+        
+        Ok(())
+    }
+    
+    /// Send a connection request packet to the guest via vhost-user protocol
+    #[cfg(feature = "backend_vsock")]
+    fn send_connection_request_to_guest(
+        &mut self,
+        dst_cid: u32,
+        dst_port: u32, 
+        src_port: u32,
+    ) -> Result<()> {
+        info!(
+            "vsock: [CID {}] sending connection request to guest CID {} port {} from local port {}",
+            self.guest_cid, dst_cid, dst_port, src_port
+        );
+        
+        // For Unix socket forwarding, we need to queue a connection request
+        // The connection will be established when the guest responds with an ACK
+        let key = ConnMapKey::new(src_port, dst_port);
+        if let Some(conn) = self.thread_backend.conn_map.get_mut(&key) {
+            // Enqueue a request operation for this connection
+            conn.rx_queue.enqueue(crate::rxops::RxOps::Request);
+            
+            // Add to backend RX queue so it gets processed
+            self.thread_backend.backend_rxq.push_back(key);
+            
+            info!(
+                "vsock: [CID {}] connection request queued for guest CID {} port {}",
+                self.guest_cid, dst_cid, dst_port
+            );
+        } else {
+            warn!("vsock: [CID {}] connection not found for sending request", self.guest_cid);
+            return Err(Error::PktBufMissing);
+        }
+        
+        Ok(())
+    }
+
+    /// Clean up a Unix socket proxy connection.
+    fn cleanup_unix_proxy_connection(&mut self, fd: RawFd, key: &ConnMapKey) {
+        info!(
+            "vsock: [CID {}] Cleaning up Unix socket proxy connection for key {:?}",
+            self.thread_backend.guest_cid, key
+        );
+
+        // Unregister the Unix socket from epoll
+        if let Err(err) = Self::epoll_unregister(self.get_epoll_fd(), fd) {
+            warn!(
+                "vsock: [CID {}] Failed to unregister fd {} from epoll: {:?}",
+                self.thread_backend.guest_cid, fd, err
+            );
+        }
+
+        // Remove the connection from our maps
+        self.thread_backend.stream_map.remove(&fd);
+        self.thread_backend.listener_map.remove(&fd);
+        self.thread_backend.conn_map.remove(key);
+        self.thread_backend.local_port_set.remove(&key.local_port());
+
+        info!(
+            "vsock: [CID {}] Unix socket proxy connection for key {:?} cleaned up",
+            self.thread_backend.guest_cid, key
+        );
+    }
 }
 
 impl Drop for VhostUserVsockThread {
@@ -803,6 +1775,10 @@ impl Drop for VhostUserVsockThread {
         match &self.backend_info {
             BackendType::UnixDomainSocket(uds_path) => {
                 let _ = std::fs::remove_file(uds_path);
+            }
+            #[cfg(feature = "backend_vsock")]
+            BackendType::UnixToVsock(_uds_path, _vsock_info) => {
+                // Nothing to do
             }
             #[cfg(feature = "backend_vsock")]
             BackendType::Vsock(_) => {
@@ -1082,5 +2058,77 @@ mod tests {
         vs2.read(&mut buf).unwrap_err();
 
         t.process_backend_evt(EventSet::empty());
+    }
+
+    #[test]
+    fn test_unix_socket_eof_after_ok_response() {
+        use std::os::unix::net::UnixStream;
+        use std::io::{Read, Write};
+        use std::thread;
+        use std::time::Duration;
+
+        let test_dir = tempdir().expect("Could not create a temp test directory.");
+        let uds_path = test_dir.path().join("test_eof.socket");
+
+        // Create VhostUserVsockThread with Unix socket backend
+        let backend_info = BackendType::UnixDomainSocket(uds_path.clone());
+        let groups: Vec<String> = vec![String::from("default")];
+        let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut thread = VhostUserVsockThread::new(backend_info, 4, CONN_TX_BUF_SIZE, groups, cid_map)
+            .expect("Failed to create VhostUserVsockThread");
+
+        // Set up guest memory
+        let mem = GuestMemoryAtomic::new(
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+        );
+        thread.mem = Some(mem.clone());
+
+        // Start the thread in background
+        let thread_handle = thread::spawn(move || {
+            // In a real scenario, this would be run by the vhost-user framework
+            // For testing, we'll just set up the listener part
+            thread.backend_info = BackendType::UnixDomainSocket(uds_path);
+        });
+
+        // Give the server a moment to start
+        thread::sleep(Duration::from_millis(100));
+
+        // Test client that mimics the Rust client behavior
+        let client_result = thread::spawn(move || -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            // Connect to Unix socket
+            let mut stream = UnixStream::connect(&uds_path)?;
+            
+            // Send request (mimicking the 9 bytes we see in logs)
+            let request = b"\x01\x00\x00\x00\x00\x00\x00\x00\x01";
+            stream.write_all(request)?;
+            
+            // Read response until EOF (this is what the Rust client does)
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            
+            Ok(String::from_utf8_lossy(&response).to_string())
+        }).join();
+
+        // Verify the result
+        match client_result {
+            Ok(Ok(response)) => {
+                assert_eq!(response, "OK 3\n", "Expected 'OK 3\\n' response");
+                println!("✅ SUCCESS: Got expected 'OK 3\\n' response with proper EOF");
+            }
+            Ok(Err(e)) => {
+                panic!("❌ Client error: {}", e);
+            }
+            Err(_) => {
+                panic!("❌ Thread join error");
+            }
+        }
+
+        // Clean up
+        if let Ok(handle) = thread_handle.join() {
+            // Thread completed
+        }
+        
+        test_dir.close().unwrap();
     }
 }

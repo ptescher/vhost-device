@@ -14,6 +14,11 @@ impl RxQueue {
         RxQueue { queue: 0_u8 }
     }
 
+    /// Check if the queue is empty.
+    pub fn is_empty(&self) -> bool {
+        self.queue == 0
+    }
+
     /// Enqueue a new rx operation into the queue.
     pub fn enqueue(&mut self, op: RxOps) {
         self.queue |= op.bitmask();
