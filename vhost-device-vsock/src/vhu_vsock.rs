@@ -83,6 +83,8 @@ pub(crate) enum Error {
     HandleEventNotEpollIn,
     #[error("Failed to handle unknown event")]
     HandleUnknownEvent,
+    #[error("Invalid connection key")]
+    InvalidKey,
     #[error("Failed to accept new local unix domain socket connection")]
     UnixAccept(std::io::Error),
     #[error("Failed to bind a unix stream")]
@@ -333,15 +335,21 @@ impl VhostUserBackend for VhostUserVsockBackend {
     }
 
     fn update_memory(&self, atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>) -> IoResult<()> {
-        info!("vsock: update_memory called for device with {} threads", self.threads.len());
+        info!(
+            "vsock: update_memory called for device with {} threads",
+            self.threads.len()
+        );
         for (idx, thread) in self.threads.iter().enumerate() {
             let mut thread_guard = thread.lock().unwrap();
             let guest_cid = thread_guard.thread_backend.guest_cid;
-            info!("vsock: [CID {}] setting memory for thread {}", guest_cid, idx);
-            
+            info!(
+                "vsock: [CID {}] setting memory for thread {}",
+                guest_cid, idx
+            );
+
             let was_none = thread_guard.mem.is_none();
             thread_guard.mem = Some(atomic_mem.clone());
-            
+
             if was_none {
                 info!("vsock: [CID {}] thread {} memory configured for first time - backend events now enabled", guest_cid, idx);
             } else {
@@ -356,7 +364,7 @@ impl VhostUserBackend for VhostUserVsockBackend {
         &self,
         device_event: u16,
         evset: EventSet,
-        vrings: &[VringRwLock],
+        vrings: &[Self::Vring],
         thread_id: usize,
     ) -> IoResult<()> {
         info!(

@@ -140,15 +140,33 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
                 Ok(())
             }
             Some(RxOps::Rw) => {
+                info!(
+                    "vsock: processing RxOps::Rw for connection lp={}, pp={} - reading from Unix socket to forward to guest",
+                    self.local_port, self.peer_port
+                );
+                
+                // Check connection state first
                 if !self.connect {
-                    // There is no host-side application listening for this
-                    // packet, hence send back an RST.
+                    warn!(
+                        "vsock: RxOps::Rw on disconnected connection lp={}, pp={} - sending RST",
+                        self.local_port, self.peer_port
+                    );
                     pkt.set_op(VSOCK_OP_RST);
                     return Ok(());
                 }
-
+                
                 // Check if peer has space for receiving data
+                let peer_credit = self.peer_avail_credit();
+                info!(
+                    "vsock: peer credit check - peer_buf_alloc={}, peer_fwd_cnt={}, rx_cnt={}, available_credit={}",
+                    self.peer_buf_alloc, self.peer_fwd_cnt.0, self.rx_cnt.0, peer_credit
+                );
+                
                 if self.need_credit_update_from_peer() {
+                    info!(
+                        "vsock: need credit update from peer (lp={}, pp={}) - re-enqueuing RxOps::Rw and sending CREDIT_REQUEST",
+                        self.local_port, self.peer_port
+                    );
                     // Re-enqueue the read so we can process it once we have credit.
                     self.rx_queue.enqueue(RxOps::Rw);
                     self.last_fwd_cnt = self.fwd_cnt;
@@ -161,28 +179,66 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
                 // data must fit inside a packet buffer and be within peer's
                 // available buffer space
                 let max_read_len = std::cmp::min(buf.len(), self.peer_avail_credit());
+                info!(
+                    "vsock: preparing to read from Unix socket - buf_len={}, peer_credit={}, max_read_len={}",
+                    buf.len(), peer_credit, max_read_len
+                );
+                
                 let mut buf = buf
                     .subslice(0, max_read_len)
                     .expect("subslicing should work since length was checked");
+                
                 // Read data from the stream directly into the buffer
                 match self.stream.read_volatile(&mut buf) {
                     Ok(read_cnt) => {
                         if read_cnt == 0 {
+                            info!(
+                                "vsock: Unix socket closed (read 0 bytes) for lp={}, pp={} - sending SHUTDOWN",
+                                self.local_port, self.peer_port
+                            );
                             // If no data was read then the stream was closed down unexpectedly.
                             // Send a shutdown packet to the guest-side application.
                             pkt.set_op(VSOCK_OP_SHUTDOWN)
                                 .set_flag(VSOCK_FLAGS_SHUTDOWN_RCV)
                                 .set_flag(VSOCK_FLAGS_SHUTDOWN_SEND);
                         } else {
+                            // Log the data being forwarded
+                            let mut debug_buf = vec![0u8; read_cnt];
+                            buf.subslice(0, read_cnt).unwrap().copy_to(&mut debug_buf);
+                            let hex_dump = debug_buf.iter()
+                                .take(32) // Show first 32 bytes
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let ascii_dump = debug_buf.iter()
+                                .take(32)
+                                .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                                .collect::<String>();
+                            
+                            info!(
+                                "vsock: read {} bytes from Unix socket for lp={}, pp={} - HEX=[{}{}] ASCII=[{}{}]",
+                                read_cnt, self.local_port, self.peer_port,
+                                hex_dump, if read_cnt > 32 { "..." } else { "" },
+                                ascii_dump, if read_cnt > 32 { "..." } else { "" }
+                            );
+                            
                             // If data was read, then set the length field in the packet header
                             // to the amount of data that was read.
                             pkt.set_op(VSOCK_OP_RW).set_len(read_cnt as u32);
 
                             if read_cnt == max_read_len {
+                                info!(
+                                    "vsock: read full buffer ({} bytes) - re-queuing RxOps::Rw for more data",
+                                    read_cnt
+                                );
                                 // Re-queue the read operation in case there's more data to process
                                 // from the Unix socket in the next available descriptor.
                                 self.rx_queue.enqueue(RxOps::Rw);
                             } else {
+                                info!(
+                                    "vsock: partial read ({} of {} bytes) - waiting for epoll notification",
+                                    read_cnt, max_read_len
+                                );
                                 // The socket read returned less data than we asked for.
                                 // It's likely empty, so let's wait for epoll to tell us
                                 // when there is more data, instead of busy-waiting.
@@ -205,10 +261,18 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
                         // Update the rx_cnt with the amount of data in the vsock packet.
                         self.rx_cnt += Wrapping(pkt.len());
                         self.last_fwd_cnt = self.fwd_cnt;
+                        info!(
+                            "vsock: updated rx_cnt to {} after forwarding {} bytes to guest (lp={}, pp={})",
+                            self.rx_cnt.0, pkt.len(), self.local_port, self.peer_port
+                        );
                     }
                     Err(vm_memory::VolatileMemoryError::IOError(e))
                         if e.kind() == ErrorKind::WouldBlock =>
                     {
+                        info!(
+                            "vsock: WouldBlock reading from Unix socket (lp={}, pp={}) - re-queuing and sending CREDIT_UPDATE",
+                            self.local_port, self.peer_port
+                        );
                         // This is not an error. It just means we've read all the data
                         // available in the socket right now.
 
@@ -271,14 +335,30 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
     /// - always `Ok(())` to indicate that the packet has been consumed
     pub fn send_pkt<B: BitmapSlice>(&mut self, pkt: &VsockPacket<B>) -> Result<()> {
         // Update peer credit information
+        let old_peer_buf_alloc = self.peer_buf_alloc;
+        let old_peer_fwd_cnt = self.peer_fwd_cnt;
+        
         self.peer_buf_alloc = pkt.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
+        
+        if old_peer_buf_alloc != self.peer_buf_alloc || old_peer_fwd_cnt.0 != self.peer_fwd_cnt.0 {
+            info!(
+                "vsock: credit update from guest - lp={}, pp={}, buf_alloc: {} -> {}, fwd_cnt: {} -> {}",
+                self.local_port, self.peer_port, 
+                old_peer_buf_alloc, self.peer_buf_alloc,
+                old_peer_fwd_cnt.0, self.peer_fwd_cnt.0
+            );
+        }
 
         match pkt.op() {
             VSOCK_OP_RESPONSE => {
                 info!(
                     "vsock: VSOCK_OP_RESPONSE received for connection lp={}, pp={} - connection acknowledged",
                     self.local_port, self.peer_port
+                );
+                info!(
+                    "vsock: connection established with buf_alloc={}, fwd_cnt={}",
+                    self.peer_buf_alloc, self.peer_fwd_cnt.0
                 );
                 self.connect = true;
             }
@@ -603,16 +683,29 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
             .set_fwd_cnt(self.fwd_cnt.0)
     }
 
-    /// Get max number of bytes we can send to peer without overflowing
-    /// the peer's buffer.
-    fn peer_avail_credit(&self) -> usize {
-        (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
+    /// Check if we need to ask the peer for a credit update.
+    pub fn need_credit_update_from_peer(&self) -> bool {
+        let peer_credit = self.peer_avail_credit();
+        let need_update = peer_credit == 0 || self.peer_buf_alloc == 0;
+        
+        info!(
+            "vsock: need_credit_update_from_peer check - lp={}, pp={}, peer_credit={}, peer_buf_alloc={}, need_update={}",
+            self.local_port, self.peer_port, peer_credit, self.peer_buf_alloc, need_update
+        );
+        
+        need_update
     }
 
-    /// Check if we need a credit update from the peer before sending
-    /// more data to it.
-    fn need_credit_update_from_peer(&self) -> bool {
-        self.peer_avail_credit() == 0
+    /// Returns the credit available at our peer.
+    pub fn peer_avail_credit(&self) -> usize {
+        let ret = (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize;
+        
+        info!(
+            "vsock: peer_avail_credit calculation - lp={}, pp={}, peer_buf_alloc={}, rx_cnt={}, peer_fwd_cnt={}, available={}",
+            self.local_port, self.peer_port, self.peer_buf_alloc, self.rx_cnt.0, self.peer_fwd_cnt.0, ret
+        );
+        
+        ret
     }
 }
 

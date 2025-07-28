@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{Read, Result as StdIOResult, Write},
+    net::Shutdown,
     ops::Deref,
     os::unix::{
         net::UnixStream,
@@ -10,7 +11,6 @@ use std::{
     },
     result::Result as StdResult,
     sync::{Arc, RwLock},
-    net::Shutdown,
 };
 
 use log::{info, warn};
@@ -24,9 +24,8 @@ use vsock::VsockStream;
 use crate::{
     rxops::*,
     vhu_vsock::{
-        BackendType, CidMap, ConnMapKey, Error, Result, VSOCK_HOST_CID,
-        VSOCK_OP_CREDIT_UPDATE, VSOCK_OP_REQUEST, VSOCK_OP_RESPONSE, VSOCK_OP_RST, VSOCK_OP_RW,
-        VSOCK_TYPE_STREAM,
+        BackendType, CidMap, ConnMapKey, Error, Result, VSOCK_HOST_CID, VSOCK_OP_REQUEST,
+        VSOCK_OP_RESPONSE, VSOCK_OP_RST, VSOCK_OP_RW, VSOCK_TYPE_STREAM,
     },
     vhu_vsock_thread::VhostUserVsockThread,
     vsock_conn::*,
@@ -269,36 +268,38 @@ impl VsockThreadBackend {
         !self.raw_pkts_queue.read().unwrap().is_empty()
     }
 
-    /// Deliver a vsock packet to the guest vsock driver.
+    /// Choose a connection that's ready for RX processing
+    fn choose_connection_for_rx(&mut self) -> Result<ConnMapKey> {
+        self.backend_rxq.pop_front().ok_or(Error::EmptyBackendRxQ)
+    }
+
+    /// Get a new packet from the backend and deliver it to the guest.
     ///
     /// Returns:
-    /// - `Ok(())` if the packet was successfully filled in
+    /// - `Ok(())` if a packet was successfully delivered
     /// - `Err(Error::EmptyBackendRxQ) if there was no available data
     pub fn recv_pkt<B: BitmapSlice>(&mut self, pkt: &mut VsockPacket<B>) -> Result<()> {
-        // Pop an event from the backend_rxq
-        let key = self.backend_rxq.pop_front().ok_or(Error::EmptyBackendRxQ)?;
-        info!("vsock: recv_pkt processing key: {:?}", key);
-
-        let conn = match self.conn_map.get_mut(&key) {
-            Some(conn) => conn,
-            None => {
-                // assume that the connection does not exist
-                warn!("vsock: recv_pkt - connection not found for key");
-                return Ok(());
+        let key = match self.choose_connection_for_rx() {
+            Ok(key) => key,
+            Err(e) => {
+                info!("vsock: recv_pkt - no connections ready for RX: {:?}", e);
+                return Err(e);
             }
         };
 
-        if conn.rx_queue.is_empty() {
-            // It's possible to have a connection with no pending RX ops,
-            // for example when the guest has no data to send. This is not
-            // an error, but we have to consume the virtio descriptor, so we
-            // craft a harmless CREDIT_UPDATE packet that the guest can
-            // safely ignore.
-            pkt.set_op(VSOCK_OP_CREDIT_UPDATE);
-            return Ok(());
-        }
+        info!("vsock: recv_pkt processing key: {:?}", key);
 
+        let conn = match self.conn_map.get(&key) {
+            Some(conn) => conn,
+            None => {
+                warn!("vsock: recv_pkt - connection not found for key {:?}", key);
+                return Err(Error::InvalidKey);
+            }
+        };
+
+        // Check if connection exists but is being reset
         if conn.rx_queue.peek() == Some(RxOps::Reset) {
+            info!("vsock: recv_pkt - connection {:?} has pending reset", key);
             // Handle RST events here
             let conn = self.conn_map.remove(&key).unwrap();
             self.listener_map.remove(&conn.stream.as_raw_fd());
@@ -333,15 +334,89 @@ impl VsockThreadBackend {
             return Ok(());
         }
 
+        // Log connection state before handling packet
+        info!(
+            "vsock: recv_pkt connection state - key:{:?}, connect:{}, rx_queue_len:{}, pending_rx:{}",
+            key, conn.connect, conn.rx_queue.len(), conn.rx_queue.pending_rx()
+        );
+
         // Handle other packet types per connection
-        conn.recv_pkt(pkt)?;
+        let conn_mut = self.conn_map.get_mut(&key).unwrap();
+
+        // Log what operation we're about to process
+        if let Some(op) = conn_mut.rx_queue.peek() {
+            info!(
+                "vsock: recv_pkt about to process operation: {:?} for connection {:?}",
+                op, key
+            );
+        }
+
+        let result = conn_mut.recv_pkt(pkt);
+
+        match &result {
+            Ok(()) => {
+                info!(
+                    "vsock: recv_pkt successfully processed packet - op:{}, len:{}",
+                    pkt.op(),
+                    pkt.len()
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "vsock: recv_pkt error processing packet for {:?}: {:?}",
+                    key, e
+                );
+            }
+        }
+
+        // Set packet header fields
+        pkt.set_src_cid(VSOCK_HOST_CID)
+            .set_dst_cid(self.guest_cid)
+            .set_src_port(conn_mut.local_port)
+            .set_dst_port(conn_mut.peer_port)
+            .set_type(VSOCK_TYPE_STREAM);
 
         info!(
             "vsock: recv_pkt delivered packet - src_cid:{}, src_port:{}, dst_cid:{}, dst_port:{}, op:{}, len:{}",
             pkt.src_cid(), pkt.src_port(), pkt.dst_cid(), pkt.dst_port(), pkt.op(), pkt.len()
         );
 
-        Ok(())
+        // Log data being sent to guest if present
+        if pkt.len() > 0 {
+            if let Some(data) = pkt.data_slice() {
+                let mut bytes = vec![0u8; std::cmp::min(32, data.len())];
+                data.subslice(0, bytes.len())
+                    .unwrap()
+                    .copy_to(&mut bytes[..]);
+
+                let hex_dump = bytes
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let ascii_dump = bytes
+                    .iter()
+                    .map(|&b| {
+                        if b.is_ascii_graphic() || b == b' ' {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect::<String>();
+
+                info!(
+                    "vsock: recv_pkt sending {} bytes to guest - HEX=[{}{}] ASCII=[{}{}]",
+                    pkt.len(),
+                    hex_dump,
+                    if pkt.len() > 32 { "..." } else { "" },
+                    ascii_dump,
+                    if pkt.len() > 32 { "..." } else { "" }
+                );
+            }
+        }
+
+        result
     }
 
     /// Deliver a guest generated packet to its destination in the backend.
@@ -360,11 +435,11 @@ impl VsockThreadBackend {
         // Log packet operation type for debugging
         info!(
             "vsock: [CID {}] GUEST TX PACKET: op={} - {}",
-            self.guest_cid, 
+            self.guest_cid,
             pkt.op(),
             match pkt.op() {
                 1 => "VSOCK_OP_REQUEST",
-                2 => "VSOCK_OP_RESPONSE", 
+                2 => "VSOCK_OP_RESPONSE",
                 3 => "VSOCK_OP_RST",
                 4 => "VSOCK_OP_SHUTDOWN",
                 5 => "VSOCK_OP_CREDIT_REQUEST",
@@ -380,7 +455,7 @@ impl VsockThreadBackend {
                 // Create a regular slice from VolatileSlice for logging
                 let mut bytes = vec![0u8; data.len()];
                 data.copy_to(&mut bytes[..]);
-                
+
                 let hex_dump = bytes
                     .iter()
                     .map(|b| format!("{:02x}", b))
@@ -388,12 +463,21 @@ impl VsockThreadBackend {
                     .join(" ");
                 let ascii_dump = bytes
                     .iter()
-                    .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                    .map(|&b| {
+                        if b.is_ascii_graphic() || b == b' ' {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
                     .collect::<String>();
-                
+
                 info!(
                     "vsock: [CID {}] GUEST TX DATA: {} bytes - HEX=[{}] ASCII=[{}]",
-                    self.guest_cid, bytes.len(), hex_dump, ascii_dump
+                    self.guest_cid,
+                    bytes.len(),
+                    hex_dump,
+                    ascii_dump
                 );
             }
         }
@@ -454,7 +538,7 @@ impl VsockThreadBackend {
         }
 
         let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
-        
+
         // Add specific logging for UnixToVsock connections
         #[cfg(feature = "backend_vsock")]
         if let BackendType::UnixToVsock(_, vsock_info) = &self.backend_info {
@@ -505,9 +589,11 @@ impl VsockThreadBackend {
         // Forward this packet to its listening connection
         info!(
             "vsock: [CID {}] forwarding packet op:{} to connection {:?}",
-            self.guest_cid, pkt.op(), key
+            self.guest_cid,
+            pkt.op(),
+            key
         );
-        
+
         let conn = self.conn_map.get_mut(&key).unwrap();
         conn.send_pkt(pkt)?;
 
@@ -884,16 +970,24 @@ impl VsockThreadBackend {
                 if !raw_vsock_pkt.data.is_empty() {
                     match conn.stream.write_all(&raw_vsock_pkt.data) {
                         Ok(()) => {
-                            let hex_dump = raw_vsock_pkt.data
+                            let hex_dump = raw_vsock_pkt
+                                .data
                                 .iter()
                                 .map(|b| format!("{:02x}", b))
                                 .collect::<Vec<_>>()
                                 .join(" ");
-                            let ascii_dump = raw_vsock_pkt.data
+                            let ascii_dump = raw_vsock_pkt
+                                .data
                                 .iter()
-                                .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                                .map(|&b| {
+                                    if b.is_ascii_graphic() || b == b' ' {
+                                        b as char
+                                    } else {
+                                        '.'
+                                    }
+                                })
                                 .collect::<String>();
-                            
+
                             info!(
                                 "vsock: [CID {}] successfully wrote {} bytes to Unix socket: HEX=[{}] ASCII=[{}]",
                                 self.guest_cid,

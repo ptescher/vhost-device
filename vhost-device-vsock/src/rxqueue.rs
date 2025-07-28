@@ -65,6 +65,11 @@ impl RxQueue {
     pub fn pending_rx(&self) -> bool {
         self.queue != 0
     }
+
+    /// Get the number of operations in the queue.
+    pub fn len(&self) -> usize {
+        self.queue.count_ones() as usize
+    }
 }
 
 #[cfg(test)]
